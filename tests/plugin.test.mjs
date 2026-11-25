@@ -193,9 +193,20 @@ test("转发：成功响应透传 x-quota-* 头", async () => {
 test("配额窗口：从 x-quota-* 构造 magpie usage", () => {
   const usage = buildUsage({ limit: 100000000, used: 25000000, remaining: 75000000, resetsAt: Date.now() + 86400000 });
   assert.equal(usage.windows.length, 1);
-  assert.equal(usage.windows[0].used, 25000000);
+  // used 必须是百分比(0-100)，不能是绝对 token 数，否则宿主按 25000000% 算成「剩余 0%」。
+  assert.equal(usage.windows[0].used, 25);
+  assert.equal(usage.windows[0].amount, 25000000);
   assert.equal(usage.windows[0].limit, 100000000);
   assert.ok(usage.windows[0].display.includes("25,000,000"));
+  assert.ok(usage.windows[0].display.includes("75,000,000 tokens left"));
+});
+
+test("配额窗口：用量极小时 used 是接近 0 的百分比而不是绝对数", () => {
+  const usage = buildUsage({ limit: 100000000, used: 626038, remaining: 99373962, resetsAt: Date.now() + 86400000 });
+  assert.equal(usage.windows[0].used, 0.63);
+  assert.equal(usage.windows[0].amount, 626038);
+  assert.ok(usage.windows[0].used < 100, "used 绝不能是绝对 token 数");
+  assert.ok(usage.windows[0].display.includes("99,373,962 tokens left"));
 });
 
 test("模型表：静态兜底 + 在线合并 + 保留用户改动", () => {
@@ -258,15 +269,16 @@ test("usage 缓存：TTL 内不重打上游；上游挂了回退旧值", async (
   const usage = createUsage(() => authBody(KEY_A), { ttlMs: 1_000, timeoutMs: 2_000, fetchImpl: fakeFetch });
   const first = await usage();
   assert.equal(calls, 1);
-  assert.equal(first.windows[0].used, 1000);
+  assert.equal(first.windows[0].amount, 1000);
+  assert.equal(first.windows[0].used, 0); // 1000/100000000 → 0%，不是绝对数
   const second = await usage();
   assert.equal(calls, 1, "TTL 内命中缓存");
-  assert.equal(second.windows[0].used, 1000);
+  assert.equal(second.windows[0].amount, 1000);
   await new Promise((r) => setTimeout(r, 1100)); // 等 TTL 过期
   fail = true;
   const third = await usage();
   assert.equal(calls, 2, "过期后重打");
-  assert.equal(third.windows[0].used, 1000, "上游失败回退旧值，不给 UI 报错");
+  assert.equal(third.windows[0].amount, 1000, "上游失败回退旧值，不给 UI 报错");
   assert.ok(usageStats.stale >= 1);
 });
 

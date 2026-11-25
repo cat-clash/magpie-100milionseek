@@ -181,7 +181,8 @@ CLI 导入同理：`bun cli/import-keys.mjs --direct keys.txt` 或 `--proxy http
 
 ## 额度与并发
 
-- 每账号每 UTC 日 **100,000,000 tokens**，响应头 `x-quota-limit / used / remaining / reset`。
+- 每账号每 UTC 日 **100,000,000 tokens**（主账号 120,000,000），响应头 `x-quota-limit / used / remaining / reset`。
+- 额度窗口按 Magpie 契约上报：`used` 是**百分比**（0–100），绝对用量走 `amount` + `limit`，`display` 直接显示剩余 token（如 `626,038 / 100,000,000 tokens · 99,373,962 tokens left`）。用量很小时会正确显示接近 0%（而不是把绝对数误当百分比显示成「剩余 0%」）。
 - 每账号并发上限 **5**；第 6 个请求站点返回 `429 session_limit_reached`，本插件标记退避。
 - 日额度耗尽 `429 daily_quota_exceeded`：本插件标记 `x-magpie-failover`，让 Magpie 自动切到下一个账号。
 - `bun` 才能跑 Magpie 插件；CLI 用 `bun` 或 Node 20+ 均可（`node:test` 风格测试两者兼容）。

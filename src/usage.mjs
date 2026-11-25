@@ -36,20 +36,29 @@ function readQuota(headers) {
 export function buildUsage(quota) {
   if (!quota) return { plan: "100 Million Seek", windows: [] };
   const limit = quota.limit ?? (quota.used != null && quota.remaining != null ? quota.used + quota.remaining : null);
-  const used = quota.used ?? (limit != null && quota.remaining != null ? limit - quota.remaining : null);
+  const amount = quota.used ?? (limit != null && quota.remaining != null ? limit - quota.remaining : null);
+  const remaining = quota.remaining ?? (limit != null && amount != null ? limit - amount : null);
   const resetsAt = quota.resetsAt ?? Date.now() + QUOTA_WINDOW_MS;
   const span = Math.max(0, resetsAt - Date.now()) || QUOTA_WINDOW_MS;
+  // Magpie 规定 used 是百分比(0-100)，amount/limit 才是按数量计时。
+  // 上游 x-quota-used 是绝对 token 数：塞进 used 会被当百分比 → UI 显示「剩余 0%」。
+  // 百分比与绝对量都给，宿主自己按 amount/limit 算用量，display 直接显示剩余。
+  const usedPct = amount != null && limit ? Math.min(100, Math.max(0, (amount / limit) * 100)) : null;
+  const remainingText = remaining != null ? `${remaining.toLocaleString()} tokens left` : "";
   return {
     plan: "100 Million Seek · 每日额度",
     windows: [
       {
         name: "每日 Token 额度（UTC）",
-        used,
+        used: usedPct == null ? undefined : Math.round(usedPct * 100) / 100,
+        amount,
         limit,
         resetsAt,
         span: QUOTA_WINDOW_MS,
         unit: "token",
-        display: used != null && limit != null ? `${used.toLocaleString()} / ${limit.toLocaleString()} tokens` : "",
+        display: amount != null && limit != null
+          ? `${amount.toLocaleString()} / ${limit.toLocaleString()} tokens${remainingText ? " · " + remainingText : ""}`
+          : "",
       },
     ],
   };
