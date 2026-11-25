@@ -133,14 +133,27 @@ bun cli/import-keys.mjs --dry-run keys.txt
         "importMax": 200,             // auth.import 内部上限（CLI 单列写 1000）
         "keyLabel": "",               // 单 Key 登录默认备注
         "debugTiming": false,         // 打开后 stderr 打一行 [hms] 耗时（TTFB/总耗时）
-        "promptCache": false,         // 条件性：给 ≥promptCacheMinChars 的前缀打 cache_control
-        "promptCacheMinChars": 2000,  // 太短的前缀不值得标记
-        "proxy": ""                   // ""=跟环境变量；"direct"=强制直连；或 "http://127.0.0.1:7897"
+        "proxy": "",                  // ""=跟环境变量；"direct"=强制直连；或 "http://127.0.0.1:7897"
+        "dropTools": []               // 转发层裁掉的工具名单：精确名或前缀通配，如 ["mcp__github__*","read_file"]
       }
     }
   ]
 }
 ```
+
+### dropTools：减小 prefill 体积
+
+上游慢在首字前的 prefill（实测 ~90ms/千 token，55K 输入要 30s+）。system prompt 是 Magpie 发的、插件动不了；但请求体里的 `tools` 数组可以裁——如果你的 agent 挂了很多 MCP 工具、实际用不到的，直接在转发层删掉它们的 schema，输入体积立减：
+
+```jsonc
+"dropTools": ["mcp__github__*", "mcp__notion__*", "read_file"]   // 前缀* 通配或精确名
+```
+
+- 只作用于 `POST /chat/completions` 的请求体，`/models` 等其它请求不受影响
+- 名单为空（默认）时字节级原样透传，零开销
+- 非法 JSON、无 tools 字段、无命中 → 原样透传，绝不弄丢请求
+- ⚠️ 裁掉的工具模型就「看不见」了——agent 真去调用会被模型拒绝。只裁你确定不用的
+- 真正的正路是在 agent 端（如 opencode / dsh 的配置里）精简挂载的工具和 system prompt；本选项是 provider 侧的最后手段
 
 ### 关于 token 速度
 
@@ -148,9 +161,10 @@ bun cli/import-keys.mjs --dry-run keys.txt
 
 - **额度/模型表全部本地缓存**：UI 不再打上游等超时；chat 请求零额外往返。
 - **连接复用**：能加载 undici 就挂共享连接池，省重复 DNS/TLS 握手。
-- **promptCache（默认关）**：上游是否认 `cache_control` 未实测。你的对话 system+tools 很大（5 万+ token）且当前 cache_read 全是 0——如果打开后上游真的认这个标记，prefill 能从几十秒砍到个位数；如果不认，请求体多个字段不影响成功。想试就在 options 里开 `"promptCache": true`，配合 `"debugTiming": true` 看 TTFB 变化。
 
-真正决定首字快慢的还是上游 prefill 和网络出口。本插件不再往请求路径上加任何等待。
+已实测并放弃的方向：`cache_control` prompt cache——上游 usage 里没有任何缓存字段，重复同前缀零收益，传了也白传（v1.1.0 曾内置后移除）。
+
+真正决定首字快慢的是上游 prefill 和网络出口。本插件不再往请求路径上加任何等待。
 
 ### 网络出口（代理挂了怎么办）
 

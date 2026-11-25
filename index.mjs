@@ -95,13 +95,10 @@ function readOptions(raw = {}) {
     importMax: clampInt(raw.importMax, CLAMP.importMax[0], CLAMP.importMax[1], DEFAULTS.importMax),
     keyLabel: typeof raw.keyLabel === "string" ? raw.keyLabel.trim() : DEFAULTS.keyLabel,
     debugTiming: raw.debugTiming === true,
-    promptCache: raw.promptCache === true,
-    promptCacheMinChars: clampInt(
-      raw.promptCacheMinChars,
-      CLAMP.promptCacheMinChars[0],
-      CLAMP.promptCacheMinChars[1],
-      DEFAULTS.promptCacheMinChars
-    ),
+    // 工具裁剪名单：精确名或 "前缀*"
+    dropTools: Array.isArray(raw.dropTools)
+      ? raw.dropTools.filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim())
+      : DEFAULTS.dropTools,
     // "direct" | "http://..." | ""（跟环境变量）
     proxy:
       raw.proxy === "direct"
@@ -149,8 +146,7 @@ export const HundredMillionSeekPlugin = async (input = {}, options = {}) => {
         modelsPath: MODELS_PATH,
         dispatcher,
         debugTiming: opts.debugTiming,
-        promptCache: opts.promptCache,
-        promptCacheMinChars: opts.promptCacheMinChars,
+        dropTools: opts.dropTools,
         proxy: opts.proxy,
       });
       fetchCache.set(getAuth, sharedFetch);

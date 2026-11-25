@@ -3,7 +3,7 @@
 
 export const PROVIDER = "hms";
 export const PROVIDER_NAME = "100 Million Seek";
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 // ---- 上游端点（base 固定，不提供自定义入口）---------------------------------
 export const BASE = "https://100milionseek.top/v1";
@@ -68,9 +68,8 @@ export const DEFAULTS = {
   importMax: 200,
   keyLabel: "",
   debugTiming: false, // 打开后 stderr 打一行耗时；默认关闭不影响行为
-  promptCache: false, // 条件性：给大 content 注入 cache_control（需代理恢复后实测）
-  promptCacheMinChars: 2_000, // 太短的前缀不值得标记
   proxy: "", // ""=跟随环境变量；"direct"=强制直连（Bun proxy:false）；或 "http://127.0.0.1:7897"
+  dropTools: [], // 转发层从请求里裁掉的工具名（精确名或 "前缀*"），减小 prefill
 };
 
 export const CLAMP = {
@@ -80,7 +79,6 @@ export const CLAMP = {
   modelListTtlMs: [60_000, 24 * 60 * 60_000],
   importMax: [1, 1000],
   providerIdPrefix: 40,
-  promptCacheMinChars: [200, 200_000],
 };
 
 // 供应商 id 只能含小写字母、数字、连字符

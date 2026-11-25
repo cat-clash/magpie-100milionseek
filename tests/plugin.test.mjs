@@ -270,16 +270,66 @@ test("usage 缓存：TTL 内不重打上游；上游挂了回退旧值", async (
   assert.ok(usageStats.stale >= 1);
 });
 
-test("prompt cache：默认不改写；显式开启才给长前缀打 cache_control", async () => {
-  const { applyPromptCache, maybeApplyPromptCache } = await import("../src/prompt-cache.mjs");
-  const long = "x".repeat(3000);
-  const payload = { messages: [{ role: "system", content: long }, { role: "user", content: "hi" }] };
-  assert.equal(maybeApplyPromptCache(JSON.stringify(payload), { enabled: false }), JSON.stringify(payload));
-  const patched = maybeApplyPromptCache(JSON.stringify(payload), { enabled: true, minChars: 2000 });
-  const parsed = JSON.parse(patched);
-  assert.equal(parsed.messages[0].content[0].cache_control.type, "ephemeral");
-  assert.equal(typeof applyPromptCache(payload, 2000), "object");
-  // 短消息不动
-  const short = maybeApplyPromptCache(JSON.stringify({ messages: [{ role: "user", content: "hi" }] }), { enabled: true, minChars: 2000 });
-  assert.deepEqual(JSON.parse(short).messages[0].content, "hi");
+test("dropTools：转发层裁掉命中的工具（精确名/前缀*/双形态），其余请求体不动", async () => {
+  const { dropToolsFromBody } = await import("../src/relay.mjs");
+  const payload = {
+    model: "deepseek-v4.1-flash-free",
+    tools: [
+      { type: "function", function: { name: "mcp__big__tool1", description: "x".repeat(2000) } },
+      { type: "function", function: { name: "keepme", description: "y" } },
+      { name: "bare_tool", description: "z".repeat(1000) },
+    ],
+  };
+  const raw = JSON.stringify(payload);
+  // 精确名
+  const a = JSON.parse(dropToolsFromBody(raw, ["bare_tool"]));
+  assert.equal(a.tools.length, 2);
+  // 前缀通配
+  const b = JSON.parse(dropToolsFromBody(raw, ["mcp__big__*"]));
+  assert.deepEqual(b.tools.map((t) => t.function?.name ?? t.name), ["keepme", "bare_tool"]);
+  // 全部裁光
+  const c = JSON.parse(dropToolsFromBody(raw, ["mcp__big__tool1", "keepme", "bare_tool"]));
+  assert.equal(c.tools.length, 0);
+  // 无命中 / 非 JSON / 无 tools 字段 → 原样返回
+  assert.equal(dropToolsFromBody(raw, ["nope"]), raw);
+  assert.equal(dropToolsFromBody("not json{", ["keepme"]), "not json{");
+  assert.equal(dropToolsFromBody(JSON.stringify({ messages: [] }), ["keepme"]), JSON.stringify({ messages: [] }));
+  // 空名单不碰 body
+  assert.equal(dropToolsFromBody(raw, []), raw);
 });
+
+test("createFetch 支持 dropTools：chat 请求裁工具，/models 不受影响", async () => {
+  const { createFetch } = _internal;
+  const calls = [];
+  const fakeFetch = async (url, init = {}) => {
+    calls.push({ url: String(url), body: init?.body });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    dropTools: ["mcp__x*"],
+  });
+  const chatBody = JSON.stringify({
+    model: "deepseek-v4.1-flash-free",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [
+      { type: "function", function: { name: "mcp__x__heavy" } },
+      { type: "function", function: { name: "stay" } },
+    ],
+  });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", {
+    method: "POST",
+    body: chatBody,
+  });
+  assert.equal(res.status, 200);
+  const sent = JSON.parse(calls[0].body);
+  assert.deepEqual(sent.tools.map((t) => t.function.name), ["stay"]);
+  // /models 请求走本地模型表，不碰 body、也不产生上游调用
+  const modelsRes = await fetchFn("https://100milionseek.top/v1/models");
+  assert.equal(modelsRes.status, 200);
+  assert.equal(calls.length, 1, "本地应答 /models，不打上游");
+});
+

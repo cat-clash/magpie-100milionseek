@@ -30,7 +30,6 @@ import {
 } from "./http.mjs";
 import { createTiming, tapStream } from "./timing.mjs";
 import { getUpstreamDispatcher, ensureUpstreamDispatcher } from "./pool.mjs";
-import { maybeApplyPromptCache } from "./prompt-cache.mjs";
 
 function tailOf(url) {
   try {
@@ -38,6 +37,28 @@ function tailOf(url) {
     return u.pathname.replace(/\/+$/, "") || "/";
   } catch {
     return String(url).split("?")[0];
+  }
+}
+
+// ---- dropTools：转发层裁工具（system prompt 动不了，tools 是唯一能安全瘦身的地方）----
+function toolNameOf(t) {
+  return String(t?.function?.name ?? t?.name ?? "");
+}
+
+/** 从 chat 请求体里剔除命中规则的 tools。任何异常都回退原始 body。 */
+export function dropToolsFromBody(raw, rules) {
+  try {
+    if (typeof raw !== "string" || !raw || !Array.isArray(rules) || rules.length === 0) return raw;
+    const j = JSON.parse(raw);
+    if (!Array.isArray(j?.tools) || j.tools.length === 0) return raw;
+    const hit = (name) =>
+      rules.some((r) => (r.endsWith("*") ? name.startsWith(r.slice(0, -1)) : name === r));
+    const kept = j.tools.filter((t) => !hit(toolNameOf(t)));
+    if (kept.length === j.tools.length) return raw;
+    j.tools = kept;
+    return JSON.stringify(j);
+  } catch {
+    return raw;
   }
 }
 
@@ -132,7 +153,7 @@ function translateError(error) {
  * 生成 loader 用的 fetch。**调用方应建一次并复用**。
  * @param {() => any} getAuth 返回当前账号登录态
  * @param {{base?:string,modelsPath?:string,fetchImpl?:Function,signal?:AbortSignal,
- *          dispatcher?:object,debugTiming?:boolean,promptCache?:boolean,promptCacheMinChars?:number,
+ *          dispatcher?:object,debugTiming?:boolean,dropTools?:string[],
  *          timingSink?:(line:string)=>void}} opts
  */
 export function createFetch(getAuth, opts = {}) {
@@ -143,8 +164,9 @@ export function createFetch(getAuth, opts = {}) {
   const staticTable = staticModelTable();
   const staticListBody = Object.freeze({ object: "list", data: buildModelList(staticTable) });
   const debugTiming = opts.debugTiming === true;
-  const promptCache = opts.promptCache === true;
-  const promptCacheMinChars = opts.promptCacheMinChars ?? DEFAULTS.promptCacheMinChars;
+  const dropRules = Array.isArray(opts.dropTools)
+    ? opts.dropTools.filter((s) => typeof s === "string" && s)
+    : [];
 
   return async function magpieFetch(input, init = {}) {
     const timing = debugTiming ? createTiming({ enabled: true, sink: opts.timingSink }) : null;
@@ -180,10 +202,11 @@ export function createFetch(getAuth, opts = {}) {
       signal = externalSignal;
     }
 
-    // 请求体：默认原样透传；promptCache 显式打开时才可能改写（改写失败自动回退）
+    // 请求体：默认原样透传；配置了 dropTools 才在转发层裁工具（只动 body.tools）
     let body = init?.body;
-    if (promptCache && body) body = maybeApplyPromptCache(body, { enabled: true, minChars: promptCacheMinChars });
-
+    if (dropRules.length && body && isChatRequest(url)) {
+      body = dropToolsFromBody(body, dropRules);
+    }
     const reqInit = { ...init, headers, signal };
     if (body !== init?.body) reqInit.body = body;
     // 同步拿共享连接池；第一次拿不到就异步补一次（本次仍走运行时默认池）
