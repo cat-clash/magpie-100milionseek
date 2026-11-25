@@ -1,0 +1,43 @@
+{
+  "name": "magpie-100milionseek-auth",
+  "version": "1.0.0",
+  "description": "100 Million Seek (100milionseek.top) provider plugin for Magpie — API Key sign-in with one-click bulk import.",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "src",
+    "cli",
+    "tests",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "import": "node cli/import-keys.mjs"
+  },
+  "engines": {
+    "bun": ">=1.1.0",
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "provider",
+    "auth",
+    "100milionseek",
+    "deepseek"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "name": "100 Million Seek",
+    "summary": {
+      "zh": "100 Million Seek (100milionseek.top) API Key 登录，支持一键批量粘贴多个 Key 导入账号。",
+      "en": "100 Million Seek (100milionseek.top) API Key sign-in with one-click bulk key import."
+    },
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0Ij48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzBiMTEyMCIvPjxwYXRoIGQ9Ik0xMyA0MWw5LTE4IDkgMTggOS0xOCA5IDE4IiBmaWxsPSJub25lIiBzdHJva2U9IiMzOGJkZjgiIHN0cm9rZS13aWR0aD0iNC41IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48Y2lyY2xlIGN4PSIzMiIgY3k9IjIzIiByPSIzLjIiIGZpbGw9IiNhNzhiZmEiLz48L3N2Zz4=",
+    "maxConcurrency": 5
+  }
+}
