@@ -1,8 +1,12 @@
 // src/usage.mjs — 读 x-quota-* 响应头，产出 magpie 的配额窗口。
-import { QUOTA_HEADERS, QUOTA_WINDOW_MS, USAGE_TIMEOUT_MS } from "./config.mjs";
+// 缓存是进程级单例：同一账号在多个 provider 实例 / 多次 hook 调用之间共享，
+// 并发调用走 singleflight，上游失败时退回上次成功的旧值（stale-while-error），
+// 避免把「暂时取不到额度」这种可容忍状态升级成 Magpie UI 的超时错误。
+import { QUOTA_HEADERS, QUOTA_WINDOW_MS, USAGE_TIMEOUT_MS, USAGE_STALE_MS, MODELS_PATH } from "./config.mjs";
 import { apiFetch, errorText, ApiError } from "./http.mjs";
 import { apiKeyOf } from "./auth.mjs";
-import { MODELS_PATH } from "./config.mjs";
+import { keyFingerprint } from "./cache-key.mjs";
+import { createTtlCache, singleflight } from "./cache.mjs";
 
 function num(v) {
   const n = Number(v);
@@ -55,11 +59,34 @@ export function usageError(error) {
   return { plan: "100 Million Seek", windows: [], error: errorText(error) };
 }
 
-/** magpie 的 usage hook：GET /v1/models 读响应头，TTL 缓存。 */
+// ---- 进程内共享缓存 ---------------------------------------------------------
+// 存 24h，实际新鲜度由调用方的 ttlMs 判定；stale 窗口用于失败兜底。
+const usageStore = createTtlCache({ ttlMs: 24 * 60 * 60_000, staleMs: USAGE_STALE_MS });
+const usageInflight = new Map();
+
+export const usageStats = { hit: 0, miss: 0, upstream: 0, coalesced: 0, stale: 0, error: 0 };
+
+export function resetUsageCache() {
+  usageStore.clear();
+  usageInflight.clear();
+  for (const k of Object.keys(usageStats)) usageStats[k] = 0;
+}
+
+/** 从响应头 / 响应体读配额的共用逻辑。 */
+function quotaOf(res) {
+  return readQuota(res?.headers) ?? readQuotaFromBody(res?.data);
+}
+
+/**
+ * magpie 的 usage hook 工厂。
+ * @param {() => any} getAuth
+ * @param {{base?:string,ttlMs?:number,staleMs?:number,timeoutMs?:number,signal?:AbortSignal,fetchImpl?:Function,dispatcher?:object,now?:()=>number}} [opts]
+ */
 export function createUsage(getAuth, opts = {}) {
   const base = String(opts.base || "https://100milionseek.top/v1").replace(/\/+$/, "");
-  const ttl = Math.max(10_000, Number(opts.ttlMs) || 30_000);
-  let cache = { at: 0, value: null, keyFp: "" };
+  const ttl = Math.max(1_000, Number(opts.ttlMs) || 30_000);
+  const timeoutMs = Math.max(500, Number(opts.timeoutMs) || USAGE_TIMEOUT_MS);
+  const now = opts.now || Date.now;
 
   return async function usage() {
     let auth;
@@ -71,28 +98,68 @@ export function createUsage(getAuth, opts = {}) {
     const key = apiKeyOf(auth);
     if (!key) return usageError("未登录");
 
-    const now = Date.now();
-    if (cache.value && now - cache.at < ttl && cache.keyFp === key) return cache.value;
+    const cacheKey = `${base}|${keyFingerprint(key)}`;
+    const fresh = usageStore.peek(cacheKey);
+    if (fresh && fresh.age < ttl) {
+      usageStats.hit += 1;
+      return fresh.value;
+    }
 
+    const pending = usageInflight.has(cacheKey);
     try {
-      const res = await apiFetch(`${base}${MODELS_PATH}`, {
-        method: "GET",
-        timeoutMs: opts.timeoutMs || USAGE_TIMEOUT_MS,
-        signal: opts.signal,
-        fetchImpl: opts.fetchImpl,
-        headers: { authorization: `Bearer ${key}` },
+      return await singleflight(usageInflight, cacheKey, async () => {
+        if (pending) usageStats.coalesced += 1;
+        // 排队期间别人可能已经刷好了
+        const again = usageStore.peek(cacheKey);
+        if (again && again.age < ttl) {
+          usageStats.hit += 1;
+          return again.value;
+        }
+        usageStats.miss += 1;
+        try {
+          const res = await apiFetch(`${base}${MODELS_PATH}`, {
+            method: "GET",
+            timeoutMs,
+            signal: opts.signal,
+            fetchImpl: opts.fetchImpl,
+            dispatcher: opts.dispatcher,
+            proxy: opts.proxy,
+            headers: { authorization: `Bearer ${key}` },
+          });
+          const value = buildUsage(quotaOf(res));
+          usageStore.set(cacheKey, value);
+          usageStats.upstream += 1;
+          return value;
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 429) {
+            // 额度耗尽也算读到：remaining=0
+            const value = buildUsage({
+              remaining: 0,
+              used: 0,
+              limit: 100_000_000,
+              resetsAt: now() + QUOTA_WINDOW_MS,
+            });
+            usageStore.set(cacheKey, value);
+            usageStats.upstream += 1;
+            return value;
+          }
+          // 上游抖动 / 超时：只要还有上次成功的值就继续用，绝不让 UI 变红
+          const stale = usageStore.getStale(cacheKey);
+          if (stale) {
+            usageStats.stale += 1;
+            return stale;
+          }
+          usageStats.error += 1;
+          return usageError(e);
+        }
       });
-      const quota = readQuota(res.headers) ?? readQuotaFromBody(res.data);
-      const value = buildUsage(quota);
-      cache = { at: now, value, keyFp: key };
-      return value;
     } catch (e) {
-      if (e instanceof ApiError && e.status === 429) {
-        // 额度耗尽也算读到：remaining=0
-        const value = buildUsage({ remaining: 0, used: 0, limit: 100_000_000, resetsAt: Date.now() + QUOTA_WINDOW_MS });
-        cache = { at: now, value, keyFp: key };
-        return value;
+      const stale = usageStore.getStale(cacheKey);
+      if (stale) {
+        usageStats.stale += 1;
+        return stale;
       }
+      usageStats.error += 1;
       return usageError(e);
     }
   };

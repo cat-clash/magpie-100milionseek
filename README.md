@@ -122,20 +122,46 @@ bun cli/import-keys.mjs --dry-run keys.txt
 {
   "plugins": [
     {
-      "spec": "<本插件路径或包名>",
+      "spec": "cat-clash/magpie-100milionseek",
       "options": {
-        "providerId": "",          // 空=hms；改了要用 --provider 同步给 CLI
-        "maxConcurrency": 5,       // 每账号并发，站点硬限 5
-        "usageCacheMs": 30000,     // 额度缓存
-        "liveModelList": true,     // 在线刷新模型表
+        "providerId": "",             // 空=hms；改了要用 --provider 同步给 CLI
+        "maxConcurrency": 5,          // 每账号并发，站点硬限 5
+        "usageCacheMs": 300000,       // 额度缓存 5 分钟（默认，不必改）
+        "usageTimeoutMs": 6000,       // 额度探测超时，必须比 Magpie UI 超时短
+        "liveModelList": true,        // 在线刷新模型表
         "modelListTtlMs": 3600000,
-        "importMax": 200,          // auth.import 内部上限（CLI 单列写 1000）
-        "keyLabel": ""             // 单 Key 登录默认备注
+        "importMax": 200,             // auth.import 内部上限（CLI 单列写 1000）
+        "keyLabel": "",               // 单 Key 登录默认备注
+        "debugTiming": false,         // 打开后 stderr 打一行 [hms] 耗时（TTFB/总耗时）
+        "promptCache": false,         // 条件性：给 ≥promptCacheMinChars 的前缀打 cache_control
+        "promptCacheMinChars": 2000,  // 太短的前缀不值得标记
+        "proxy": ""                   // ""=跟环境变量；"direct"=强制直连；或 "http://127.0.0.1:7897"
       }
     }
   ]
 }
 ```
+
+### 关于 token 速度
+
+实测慢在**首字之前的 prefill**（上游对大输入极慢），不是吐字阶段。本插件能省的：
+
+- **额度/模型表全部本地缓存**：UI 不再打上游等超时；chat 请求零额外往返。
+- **连接复用**：能加载 undici 就挂共享连接池，省重复 DNS/TLS 握手。
+- **promptCache（默认关）**：上游是否认 `cache_control` 未实测。你的对话 system+tools 很大（5 万+ token）且当前 cache_read 全是 0——如果打开后上游真的认这个标记，prefill 能从几十秒砍到个位数；如果不认，请求体多个字段不影响成功。想试就在 options 里开 `"promptCache": true`，配合 `"debugTiming": true` 看 TTFB 变化。
+
+真正决定首字快慢的还是上游 prefill 和网络出口。本插件不再往请求路径上加任何等待。
+
+### 网络出口（代理挂了怎么办）
+
+系统代理（Clash 等）节点不可用时，Magpie 里所有走环境变量代理的请求都会超时（UI 显示「暂时无法获取最新额度」）。本插件可单独指定出口，不影响其他插件：
+
+```jsonc
+"proxy": "direct"                  // 强制直连（Bun 唯一可靠写法）
+"proxy": "http://127.0.0.1:7897"    // 指定某个代理
+```
+
+CLI 导入同理：`bun cli/import-keys.mjs --direct keys.txt` 或 `--proxy http://127.0.0.1:7897`。
 
 ---
 

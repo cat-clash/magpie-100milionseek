@@ -2,6 +2,12 @@
 // 脱敏规则针对 hms- Key；绝不把明文 Key 写进日志或错误文案。
 import { VERIFY_TIMEOUT_MS, USER_AGENT } from "./config.mjs";
 
+/** 所有 JSON 小请求共用的默认头（模块级常量，避免每次请求重建）。 */
+const DEFAULT_HEADERS = Object.freeze({
+  accept: "application/json",
+  "user-agent": USER_AGENT,
+});
+
 export class ApiError extends Error {
   constructor(message, init = {}) {
     super(String(message ?? "请求失败"));
@@ -149,21 +155,19 @@ export function apiErrorFromResponse(response, payload, rawText) {
 
 /** 小请求统一入口：带超时、统一错误、返回 headers 供配额读取。 */
 export async function apiFetch(url, init = {}) {
-  const { timeoutMs = VERIFY_TIMEOUT_MS, signal, headers, method = "GET", body, fetchImpl } = init;
+  const { timeoutMs = VERIFY_TIMEOUT_MS, signal, headers, method = "GET", body, fetchImpl, dispatcher, proxy } = init;
   const finalSignal = timeoutSignal(timeoutMs, signal);
   const doFetch = fetchImpl ?? fetch;
+  // 预置的默认头只建一次，不再每次请求重新展开一遍对象字面量
+  const finalHeaders = { ...DEFAULT_HEADERS, ...(headers ?? {}) };
   let response;
   try {
-    response = await doFetch(url, {
-      method,
-      body,
-      signal: finalSignal,
-      headers: {
-        accept: "application/json",
-        "user-agent": USER_AGENT,
-        ...(headers ?? {}),
-      },
-    });
+    const reqInit = { method, body, signal: finalSignal, headers: finalHeaders };
+    // dispatcher 是 undici 扩展字段；运行时未装 undici 时这里是 undefined，不会传进去。
+    if (dispatcher) reqInit.dispatcher = dispatcher;
+    // proxy: false = Bun 强制直连（唯一可靠写法）；字符串 = 指定代理；不传 = 跟随环境变量。
+    if (proxy === false || (typeof proxy === "string" && proxy)) reqInit.proxy = proxy;
+    response = await doFetch(url, reqInit);
   } catch (e) {
     if (isAbort(e) && signal?.aborted) throw abortError();
     throw new ApiError(`请求失败：${errorText(e)}`, { status: 0, cause: e });

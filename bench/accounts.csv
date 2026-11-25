@@ -1,0 +1,9 @@
+key_masked,path,run,ttft_ms,total_ms,chunks,chars,tok_per_s,source_round,reliable
+hms-O_U0…C4LA,proxy,1,15522,15525,,837,,R2_probe,true
+hms-O_U0…C4LA,direct,1,27489,27491,,837,,R2_probe,true
+hms-O_U0…C4LA,proxy,1,3876,,,,-prelim,false
+hms-KHzI…wIOg,proxy,1,4225,,,,-prelim,false
+hms-u6Jc…nxKI,proxy,1,4332,,,,-prelim,false
+hms-wJwW…l96g,proxy,1,4964,,,,-prelim,false
+hms-tkcW…0o3w,proxy,1,20158,,,,-prelim,false
+hms-nidz…Yoe8,proxy,1,27586,,,,-prelim,false

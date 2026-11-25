@@ -3,7 +3,7 @@
 
 export const PROVIDER = "hms";
 export const PROVIDER_NAME = "100 Million Seek";
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 
 // ---- 上游端点（base 固定，不提供自定义入口）---------------------------------
 export const BASE = "https://100milionseek.top/v1";
@@ -37,9 +37,21 @@ export const QUOTA_WINDOW_MS = 24 * 60 * 60_000; // 每账号每 UTC 日重置
 // ---- 超时 / 缓存 ------------------------------------------------------------
 export const CHAT_TIMEOUT_MS = 600_000;
 export const VERIFY_TIMEOUT_MS = 15_000;
-export const USAGE_TIMEOUT_MS = 15_000;
-export const USAGE_TTL_MS = 30_000;
+// usage 探测必须比 Magpie UI 自己的超时短，否则 UI 先超时报「暂时无法获取最新额度」。
+export const USAGE_TIMEOUT_MS = 6_000;
+// 上游 /models 实测 0.33s ~ 4s 且抖，额度没必要 30s 打一次：5 分钟内复用上次结果。
+export const USAGE_TTL_MS = 300_000;
+// 失败时的兜底：过期不超过这么久就继续用旧值（stale-while-error）。
+export const USAGE_STALE_MS = 30 * 60_000;
 export const MODEL_LIST_TTL_MS = 60 * 60_000;
+// 首次冷启动拉模型表的超时；失败立刻回退静态表，不拖住模型列表。
+export const MODEL_LIST_TIMEOUT_MS = 4_000;
+
+// ---- 上游连接复用（undici Agent / 运行时 keep-alive）-------------------------
+export const UPSTREAM_KEEPALIVE_MS = 30_000;
+export const UPSTREAM_KEEPALIVE_MAX_MS = 120_000;
+export const UPSTREAM_CONNECTIONS = 16;
+export const UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 
 // ---- 并发：站点硬限每账号 5 个并行，第 6 个 429 ------------------------------
 export const ACCOUNT_CONCURRENCY = 5;
@@ -50,18 +62,25 @@ export const DEFAULTS = {
   providerId: "", // 空 = PROVIDER (hms)
   maxConcurrency: ACCOUNT_CONCURRENCY,
   usageCacheMs: USAGE_TTL_MS,
+  usageTimeoutMs: USAGE_TIMEOUT_MS,
   liveModelList: true,
   modelListTtlMs: MODEL_LIST_TTL_MS,
   importMax: 200,
   keyLabel: "",
+  debugTiming: false, // 打开后 stderr 打一行耗时；默认关闭不影响行为
+  promptCache: false, // 条件性：给大 content 注入 cache_control（需代理恢复后实测）
+  promptCacheMinChars: 2_000, // 太短的前缀不值得标记
+  proxy: "", // ""=跟随环境变量；"direct"=强制直连（Bun proxy:false）；或 "http://127.0.0.1:7897"
 };
 
 export const CLAMP = {
   maxConcurrency: [1, 1000],
-  usageCacheMs: [10_000, 600_000],
+  usageCacheMs: [10_000, 3_600_000],
+  usageTimeoutMs: [1_000, 15_000],
   modelListTtlMs: [60_000, 24 * 60 * 60_000],
   importMax: [1, 1000],
   providerIdPrefix: 40,
+  promptCacheMinChars: [200, 200_000],
 };
 
 // 供应商 id 只能含小写字母、数字、连字符

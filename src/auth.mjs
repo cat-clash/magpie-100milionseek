@@ -58,6 +58,7 @@ export async function verifyApiKey(apiKey, options = {}) {
       timeoutMs: options.timeoutMs || VERIFY_TIMEOUT_MS,
       signal: options.signal,
       fetchImpl: options.fetchImpl,
+      proxy: options.proxy,
       headers: { authorization: `Bearer ${key}` },
     });
     const quota = quotaFromHeaders(res.headers);

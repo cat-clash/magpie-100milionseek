@@ -1,5 +1,12 @@
 // src/relay.mjs — loader 的 fetch 包装：只拦 /models，其余原样转发上游。
 // 错误按站点返回码分档：401 → sign-in expired；429 quota → 换账号；429 session → 退避。
+//
+// 延迟相关要点（本文件是热路径，每个请求都走这里）：
+// 1. createFetch 由 index.mjs 建一次并复用，不再每次 fetch 重新构造闭包/模型表。
+// 2. GET /models 直接读进程内模型表缓存（TTL 由 provider hook 维护），零上游请求。
+// 3. 成功路径是「Response 直通」，不 clone、不读 body；只有失败分支读一次 text()。
+// 4. 有 undici 时挂共享 dispatcher（连接复用）；没有就完全不传该字段。
+// 5. debugTiming 打开才打点，关闭时零分支开销（timing.enabled 为 false 直接 return）。
 import {
   BASE,
   CHAT_PATH,
@@ -7,9 +14,10 @@ import {
   CHAT_TIMEOUT_MS,
   VERIFY_TIMEOUT_MS,
   QUOTA_HEADERS,
+  DEFAULTS,
 } from "./config.mjs";
 import { apiKeyOf } from "./auth.mjs";
-import { staticModelTable } from "./models.mjs";
+import { staticModelTable, peekModelTable } from "./models.mjs";
 import {
   ApiError,
   abortError,
@@ -20,6 +28,9 @@ import {
   errorText,
   timeoutSignal,
 } from "./http.mjs";
+import { createTiming, tapStream } from "./timing.mjs";
+import { getUpstreamDispatcher, ensureUpstreamDispatcher } from "./pool.mjs";
+import { maybeApplyPromptCache } from "./prompt-cache.mjs";
 
 function tailOf(url) {
   try {
@@ -58,6 +69,13 @@ function quotaHeadersInto(target, source) {
         /* ignore */
       }
     }
+  });
+}
+
+/** 未登录统一出口，两处调用共用一份响应构造。 */
+function missingKeyResponse() {
+  return errorResponse(401, "未登录或 Key 缺失", "sign_in_required", "missing_api_key", {
+    "x-magpie-sign-in": "expired",
   });
 }
 
@@ -111,48 +129,44 @@ function translateError(error) {
 }
 
 /**
- * 生成 loader 用的 fetch。
+ * 生成 loader 用的 fetch。**调用方应建一次并复用**。
  * @param {() => any} getAuth 返回当前账号登录态
- * @param {{base?:string,modelsPath?:string,fetchImpl?:Function,signal?:AbortSignal}} opts
+ * @param {{base?:string,modelsPath?:string,fetchImpl?:Function,signal?:AbortSignal,
+ *          dispatcher?:object,debugTiming?:boolean,promptCache?:boolean,promptCacheMinChars?:number,
+ *          timingSink?:(line:string)=>void}} opts
  */
 export function createFetch(getAuth, opts = {}) {
   const base = String(opts.base || BASE).replace(/\/+$/, "");
   const modelsPath = opts.modelsPath || MODELS_PATH;
   const upstreamFetch = opts.fetchImpl || globalThis.fetch;
+  // 模型表在闭包里只快照一次；静态表本身不可变，在线刷新由 provider hook 写入 peekModelTable()
   const staticTable = staticModelTable();
+  const staticListBody = Object.freeze({ object: "list", data: buildModelList(staticTable) });
+  const debugTiming = opts.debugTiming === true;
+  const promptCache = opts.promptCache === true;
+  const promptCacheMinChars = opts.promptCacheMinChars ?? DEFAULTS.promptCacheMinChars;
 
   return async function magpieFetch(input, init = {}) {
+    const timing = debugTiming ? createTiming({ enabled: true, sink: opts.timingSink }) : null;
     const url = typeof input === "string" ? input : input?.url ?? String(input);
     const externalSignal = init?.signal ?? opts.signal;
+    const path = tailOf(url);
 
-    // GET /models：本地应答，免得每次都打上游 + 顺带鉴权校验都由登录阶段做了
+    // GET /models：本地应答。优先用 provider hook 刷进缓存的在线表，否则静态表。
     if (isModelsRequest(url) && (init?.method ?? "GET").toUpperCase() === "GET") {
       const auth = await getAuth();
-      const key = apiKeyOf(auth);
-      if (!key) {
-        return errorResponse(401, "未登录或 Key 缺失", "sign_in_required", "missing_api_key", {
-          "x-magpie-sign-in": "expired",
-        });
-      }
+      if (!apiKeyOf(auth)) return missingKeyResponse();
+      const live = peekModelTable();
       const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
       headers.set("cache-control", "no-store");
-      const data = Object.values(staticTable).map((m) => ({
-        id: m.id,
-        object: "model",
-        owned_by: "100milionseek",
-        name: m.name,
-        limit: m.limit,
-      }));
-      return jsonResponse({ object: "list", data }, { status: 200, headers });
+      const payload = live ? { object: "list", data: buildModelList(live) } : staticListBody;
+      timing?.finish(path, 200);
+      return jsonResponse(payload, { status: 200, headers });
     }
 
     const auth = await getAuth();
     const key = apiKeyOf(auth);
-    if (!key) {
-      return errorResponse(401, "未登录或 Key 缺失", "sign_in_required", "missing_api_key", {
-        "x-magpie-sign-in": "expired",
-      });
-    }
+    if (!key) return missingKeyResponse();
 
     const headers = cleanHeaders(init);
     headers.set("authorization", `Bearer ${key}`);
@@ -166,41 +180,87 @@ export function createFetch(getAuth, opts = {}) {
       signal = externalSignal;
     }
 
+    // 请求体：默认原样透传；promptCache 显式打开时才可能改写（改写失败自动回退）
+    let body = init?.body;
+    if (promptCache && body) body = maybeApplyPromptCache(body, { enabled: true, minChars: promptCacheMinChars });
+
+    const reqInit = { ...init, headers, signal };
+    if (body !== init?.body) reqInit.body = body;
+    // 同步拿共享连接池；第一次拿不到就异步补一次（本次仍走运行时默认池）
+    let dispatcher = opts.dispatcher ?? getUpstreamDispatcher();
+    if (!dispatcher) dispatcher = await ensureUpstreamDispatcher();
+    if (dispatcher) reqInit.dispatcher = dispatcher;
+    else delete reqInit.dispatcher;
+    // 代理策略：direct = 强制直连（Bun 唯一可靠写法 proxy:false）；URL = 指定代理；空 = 跟随 env。
+    if (opts.proxy === "direct") reqInit.proxy = false;
+    else if (typeof opts.proxy === "string" && opts.proxy) reqInit.proxy = opts.proxy;
+    else delete reqInit.proxy;
+
     let res;
     try {
-      res = await upstreamFetch(target, { ...init, headers, signal });
+      res = await upstreamFetch(target, reqInit);
     } catch (e) {
       if (isAbort(e) && externalSignal?.aborted) throw abortError();
+      timing?.finish(path, 0);
       return translateError(new ApiError(errorText(e), { status: 0, cause: e }));
     }
 
     if (!res?.ok) {
-      let body = null;
+      // 失败分支不需要保留 body，直接读 text（不 clone，省一次 tee）
+      let text = "";
       try {
-        const text = await res.clone().text();
-        try {
-          body = JSON.parse(text);
-        } catch {
-          body = { raw: text.slice(0, 300) };
-        }
+        text = await res.text();
       } catch {
         /* ignore */
       }
-      const err = new ApiError(body?.error?.message || body?.message || `HTTP ${res?.status}`, {
+      let parsed = null;
+      if (text) {
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = { raw: text.slice(0, 300) };
+        }
+      }
+      const err = new ApiError(parsed?.error?.message || parsed?.message || `HTTP ${res?.status}`, {
         status: res?.status ?? 0,
-        code: body?.error?.code || body?.code || "",
-        type: body?.error?.type || body?.type || "",
-        body,
+        code: parsed?.error?.code || parsed?.code || "",
+        type: parsed?.error?.type || parsed?.type || "",
+        body: parsed,
       });
       if (res?.status === 401) err.signIn = "expired";
+      timing?.finish(path, res?.status ?? 0);
       return translateError(err);
     }
 
-    // 成功响应：把配额响应头透传出去，Usage hook 也能读到
-    const outHeaders = new Headers(res.headers);
-    outHeaders.delete("content-encoding");
-    outHeaders.delete("content-length");
-    quotaHeadersInto(outHeaders, res.headers);
-    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: outHeaders });
+    // 成功响应：Response 直通。headers 只做必要修补，body 不碰（除非 debugTiming 打点）。
+    // res.headers 已经是 Headers 实例，直接改它比重建一份再复制便宜，且不影响 body 流。
+    let outHeaders = res.headers;
+    try {
+      outHeaders.delete("content-encoding");
+      outHeaders.delete("content-length");
+      quotaHeadersInto(outHeaders, res.headers);
+    } catch {
+      // 少数运行时的 headers 是只读的，退回复制一份
+      outHeaders = new Headers(res.headers);
+      outHeaders.delete("content-encoding");
+      outHeaders.delete("content-length");
+      quotaHeadersInto(outHeaders, res.headers);
+    }
+
+    const outBody = timing ? tapStream(res.body, timing) : res.body;
+    const out = new Response(outBody, { status: res.status, statusText: res.statusText, headers: outHeaders });
+    // 只打点不等待：body 还没消费完，finish 由 tapStream 在流结束时输出总耗时
+    return out;
   };
+}
+
+/** 把模型表转成 OpenAI /v1/models 的 data 数组（只在表变化时算一次）。 */
+function buildModelList(table) {
+  return Object.values(table).map((m) => ({
+    id: m.id,
+    object: "model",
+    owned_by: "100milionseek",
+    name: m.name,
+    limit: m.limit,
+  }));
 }

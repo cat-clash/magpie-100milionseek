@@ -45,6 +45,7 @@ function parseArgs(args) {
     config: "",
     help: false,
     stdin: false,
+    proxy: "",
   };
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
@@ -53,12 +54,14 @@ function parseArgs(args) {
     else if (a === "--reset") out.reset = true;
     else if (a === "--json") out.json = true;
     else if (a === "--stdin") out.stdin = true;
+    else if (a === "--direct") out.proxy = "direct";
     else if (a === "-h" || a === "--help") out.help = true;
-    else if (a === "--provider" || a === "--config") {
+    else if (a === "--provider" || a === "--config" || a === "--proxy") {
       const v = args[++i];
       if (v) out[a.slice(2)] = v;
     } else if (a.startsWith("--provider=")) out.provider = a.split("=")[1];
     else if (a.startsWith("--config=")) out.config = a.slice(a.indexOf("=") + 1);
+    else if (a.startsWith("--proxy=")) out.proxy = a.slice(a.indexOf("=") + 1);
     else if (!a.startsWith("-")) out.files.push(a);
   }
   return out;
@@ -122,6 +125,8 @@ magpie-100milionseek 批量导入
   --reset            先清空现有同 provider 账号再写
   --json             以 JSON 输出结果
   --stdin            强制从 stdin 读取
+  --direct           强制直连上游（Bun proxy:false），忽略环境变量代理
+  --proxy <url>      指定代理（如 http://127.0.0.1:7897）
   -h, --help         显示帮助
 `.trim();
 
@@ -170,7 +175,7 @@ async function main() {
       continue;
     }
     if (opt.verify) {
-      const check = await verifyApiKey(key);
+      const check = await verifyApiKey(key, { proxy: options.proxy });
       if (!check.ok) {
         results.push({ key, status: "invalid", reason: check.reason });
         continue;

@@ -216,3 +216,70 @@ test("options 收口：非法值回退默认值", () => {
   assert.equal(o.providerId, "");
   assert.equal(o.liveModelList, false);
 });
+
+test("多账号：不同 getAuth 的 fetch 各用各的 Key，不串号", async () => {
+  const seen = [];
+  const fakeFetch = async (url, init) => {
+    seen.push(String(init?.headers?.get?.("authorization") ?? init?.headers?.authorization ?? ""));
+    return new Response(JSON.stringify({ choices: [] }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const { createFetch } = _internal;
+  const fetchA = createFetch(() => authBody(KEY_A), { fetchImpl: fakeFetch });
+  const fetchB = createFetch(() => authBody(KEY_B), { fetchImpl: fakeFetch });
+  await fetchA("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  await fetchB("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  await fetchA("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(seen.length, 3);
+  const keyA = apiKeyOf(authBody(KEY_A));
+  const keyB = apiKeyOf(authBody(KEY_B));
+  assert.ok(seen[0].includes(keyA.slice(-8)), "A 用 A 的 key");
+  assert.ok(seen[1].includes(keyB.slice(-8)), "B 用 B 的 key");
+  assert.equal(seen[2], seen[0], "第二次 A 仍是 A 的 key");
+});
+
+test("usage 缓存：TTL 内不重打上游；上游挂了回退旧值", async () => {
+  const { createUsage, resetUsageCache, usageStats } = await import("../src/usage.mjs");
+  resetUsageCache();
+  let calls = 0;
+  let fail = false;
+  const fakeFetch = async () => {
+    calls += 1;
+    if (fail) throw new Error("upstream down");
+    return new Response("{}", {
+      status: 200,
+      headers: {
+        "x-quota-limit": "100000000",
+        "x-quota-used": "1000",
+        "x-quota-remaining": "99999000",
+        "x-quota-reset": String(Math.floor(Date.now() / 1000) + 86400),
+      },
+    });
+  };
+  const usage = createUsage(() => authBody(KEY_A), { ttlMs: 1_000, timeoutMs: 2_000, fetchImpl: fakeFetch });
+  const first = await usage();
+  assert.equal(calls, 1);
+  assert.equal(first.windows[0].used, 1000);
+  const second = await usage();
+  assert.equal(calls, 1, "TTL 内命中缓存");
+  assert.equal(second.windows[0].used, 1000);
+  await new Promise((r) => setTimeout(r, 1100)); // 等 TTL 过期
+  fail = true;
+  const third = await usage();
+  assert.equal(calls, 2, "过期后重打");
+  assert.equal(third.windows[0].used, 1000, "上游失败回退旧值，不给 UI 报错");
+  assert.ok(usageStats.stale >= 1);
+});
+
+test("prompt cache：默认不改写；显式开启才给长前缀打 cache_control", async () => {
+  const { applyPromptCache, maybeApplyPromptCache } = await import("../src/prompt-cache.mjs");
+  const long = "x".repeat(3000);
+  const payload = { messages: [{ role: "system", content: long }, { role: "user", content: "hi" }] };
+  assert.equal(maybeApplyPromptCache(JSON.stringify(payload), { enabled: false }), JSON.stringify(payload));
+  const patched = maybeApplyPromptCache(JSON.stringify(payload), { enabled: true, minChars: 2000 });
+  const parsed = JSON.parse(patched);
+  assert.equal(parsed.messages[0].content[0].cache_control.type, "ephemeral");
+  assert.equal(typeof applyPromptCache(payload, 2000), "object");
+  // 短消息不动
+  const short = maybeApplyPromptCache(JSON.stringify({ messages: [{ role: "user", content: "hi" }] }), { enabled: true, minChars: 2000 });
+  assert.deepEqual(JSON.parse(short).messages[0].content, "hi");
+});
