@@ -3,7 +3,7 @@
 
 export const PROVIDER = "hms";
 export const PROVIDER_NAME = "100 Million Seek";
-export const VERSION = "1.3.0";
+export const VERSION = "1.3.1";
 
 // ---- 上游端点（base 固定，不提供自定义入口）---------------------------------
 export const BASE = "https://100milionseek.top/v1";
@@ -52,6 +52,11 @@ export const SESSION_RETRY_MAX = 2; // 最多重试 2 次（共 3 次尝试）
 export const SESSION_RETRY_BASE_MS = 250; // 250ms → 500ms，叠加 ±20% jitter
 export const SESSION_RETRY_MAX_WAIT_MS = 3_000; // 单次等待上限，避免把流卡成假死
 
+// ---- 429 时在插件内换 Key（不依赖 magpie 是否认识 x-magpie-failover）----------
+// 同账号重试仍失败 / 日额度耗尽时，拿本供应商池子里的另一把 Key 重发一次。
+// 0 = 关掉（只靠宿主轮转）；默认 2 —— 多试两把基本能绕开单账号的拥挤与额度耗尽。
+export const KEY_FAILOVER_MAX = 2;
+
 // ---- 配额（响应头，见 docs：x-quota-limit/used/remaining/reset）--------------
 export const QUOTA_HEADERS = {
   limit: "x-quota-limit",
@@ -98,6 +103,7 @@ export const DEFAULTS = {
   proxy: "", // ""=跟随环境变量；"direct"=强制直连（Bun proxy:false）；或 "http://127.0.0.1:7897"
   dropTools: [], // 转发层从请求里裁掉的工具名（精确名或 "前缀*"），减小 prefill
   sessionRetry: SESSION_RETRY_MAX, // 429 并发限流时插件内重试次数（0 = 关掉，直接甩给宿主）
+  keyFailover: true, // 429 时在插件内换另一把 Key 重发（不依赖宿主轮转）
 };
 
 export const CLAMP = {

@@ -1,6 +1,6 @@
 {
   "name": "magpie-100milionseek-auth",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "100 Million Seek (100milionseek.top) provider plugin for Magpie — API Key sign-in with one-click bulk import.",
   "type": "module",
   "main": "./index.mjs",

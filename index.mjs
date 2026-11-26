@@ -42,6 +42,7 @@ import {
   uidOf,
 } from "./src/auth.mjs";
 import { createFetch } from "./src/relay.mjs";
+import { createKeyPool } from "./src/key-pool.mjs";
 import {
   staticModelTable,
   fetchModelTable,
@@ -115,6 +116,8 @@ function readOptions(raw = {}) {
       CLAMP.sessionRetry[1],
       DEFAULTS.sessionRetry
     ),
+    // 429 时插件内换 Key 重发（不依赖宿主是否认识 x-magpie-failover）
+    keyFailover: raw.keyFailover !== false,
   };
 }
 
@@ -143,6 +146,11 @@ export const HundredMillionSeekPlugin = async (input = {}, options = {}) => {
     if (dispatcher) log(`上游连接池已启用：${JSON.stringify(poolInfo())}`);
   }
 
+  // 429 换号用的 Key 池：读 Magpie 登录态文件，按 provider 取同站的其他 hms- Key。
+  // 只在插件工厂构造一次；读盘有 30s 缓存，不进请求热路径。
+  const keyPool = opts.keyFailover ? createKeyPool(provider) : null;
+  const fallbackKeysFor = (currentKey) => keyPool?.candidates(currentKey) ?? [];
+
   // loader 的 fetch 只创建一次，后续所有请求复用同一闭包。
   // 按 getAuth 函数引用缓存：宿主给每个账号传不同 getAuth 时不会串号；
   // 宿主对同一账号重复调用时仍然复用同一个 fetch 闭包。
@@ -158,6 +166,8 @@ export const HundredMillionSeekPlugin = async (input = {}, options = {}) => {
         dropTools: opts.dropTools,
         proxy: opts.proxy,
         sessionRetry: opts.sessionRetry,
+        keyFailover: opts.keyFailover,
+        fallbackKeys: fallbackKeysFor,
       });
       fetchCache.set(getAuth, sharedFetch);
     }
@@ -317,6 +327,7 @@ export const _internal = {
   failedAuth,
   apiKeyOf,
   createFetch,
+  createKeyPool,
   staticModelTable,
   fetchModelTable,
   mergeModelTables,

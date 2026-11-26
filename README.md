@@ -49,11 +49,20 @@
 
 | 429 code | 含义 | 本插件行为 |
 | --- | --- | --- |
-| `session_limit_reached` | 第 6 个并发请求 | 插件内短退避重试（`sessionRetry`，默认 2 次，250ms→500ms + jitter）；仍失败才返回 429，并同时带 `retry-after` + `x-magpie-failover: true`（换下一个账号，别让这个号干等） |
-| `daily_quota_exceeded` | 当日额度用完 | 直接 `x-magpie-failover: true`，宿主换下一个账号 |
+| `session_limit_reached` | 第 6 个并发请求 | 插件内短退避重试（`sessionRetry`，默认 2 次，250ms→500ms + jitter）；仍失败就换池子里另一把 Key 重发 |
+| `daily_quota_exceeded` | 当日额度用完 | 插件内直接换另一把 Key 重发（`keyFailover`，默认开，最多换 2 把） |
 
-要点：宿主只会看到「真的挤不出来」的那种 429，而且一次只影响一个账号 —— 池子里还有 17 个。
-**别把 `maxConcurrency` 调到 5 以上**：站点硬限 5，超了必然 429。
+**换号不依赖宿主**：magpie 主程序识别的响应头里没有 `x-magpie-failover` / `x-magpie-retry`
+（2026-11-26 查二进制里的 `MAGPIE_ONLY` 常量表），所以 1.3.1 起插件自己读
+`plugin-auth.json` 里同供应商的 `hms-` Key 池，429 时用另一把 Key 原样重发同一请求
+（body 必须可重放；流式 body 不换号）。宿主看到的是换号后的真实结果，不是 429。
+两次换号都不行才把 429 返回，并照旧带上 `x-magpie-failover` 标记。
+
+- `keyFailover: false` 可关掉（只留同账号重试）；`sessionRetry: 0` 可关掉退避重试。
+- 池子读盘有 30s 缓存，不进请求热路径；`plugin-auth.json` 里改完账号最多等 30s 生效。
+- 所有 Key 都是**当前这个 magpie 供应商**的登录态，插件不会碰其他供应商的凭据。
+- 站点每账号 5 并发、500M/天的硬限仍在；18 把 Key ≈ 90 亿 token/天、90 并发。
+  **别把 `maxConcurrency` 调到 5 以上**：超了必然撞 `session_limit_reached`。
 
 ---
 
@@ -184,7 +193,8 @@ bun cli/import-keys.mjs --dry-run keys.txt
         "debugTiming": false,         // 打开后 stderr 打一行 [hms] 耗时（TTFB/总耗时）
         "proxy": "",                  // ""=跟环境变量；"direct"=强制直连；或 "http://127.0.0.1:7897"
         "dropTools": [],              // 转发层裁掉的工具名单：精确名或前缀通配，如 ["mcp__github__*","read_file"]
-        "sessionRetry": 2             // 429 并发限流时插件内重试次数（0=关，直接交给宿主）
+        "sessionRetry": 2,            // 429 并发限流时插件内重试次数（0=关，直接交给宿主）
+        "keyFailover": true           // 429 时插件内换另一把 Key 重发（不依赖宿主轮转）
       }
     }
   ]
@@ -248,7 +258,7 @@ bun test tests/plugin.test.mjs
 node --test tests/plugin.test.mjs
 ```
 
-32 个用例覆盖：导出形态、config 装配、智能识别/去重/截断、脱敏、登录态结构、转发分档（401/429/成功透传）、配额窗口、模型表合并与 judge 过滤、上游元数据映射、429 并发重试（成功/用尽/关闭/流式 body 不重发）、options 收口。
+37 个用例覆盖：导出形态、config 装配、智能识别/去重/截断、脱敏、登录态结构、转发分档（401/429/成功透传）、配额窗口、模型表合并与 judge 过滤、上游元数据映射、429 并发重试（成功/用尽/关闭/流式 body 不重发）、429 插件内换 Key（额度耗尽/重试耗尽后换、开关、池子读取去重）、options 收口。
 
 ---
 

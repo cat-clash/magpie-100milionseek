@@ -497,5 +497,115 @@ test("options：sessionRetry 收口（0 合法、超界截断、非法回退默�
   assert.equal(_internal.readOptions({ sessionRetry: 0 }).sessionRetry, 0);
   assert.equal(_internal.readOptions({ sessionRetry: 99 }).sessionRetry, 5);
   assert.equal(_internal.readOptions({ sessionRetry: "x" }).sessionRetry, 2);
+  assert.equal(_internal.readOptions({ keyFailover: false }).keyFailover, false);
+  assert.equal(_internal.readOptions({}).keyFailover, true);
+});
+
+test("429 换 Key：第一把 Key 撞日额度，插件内换第二把，宿主看到 200", async () => {
+  const { createFetch } = _internal;
+  const seen = [];
+  const fakeFetch = async (url, init = {}) => {
+    const auth = String(init?.headers?.get?.("authorization") ?? "");
+    seen.push(auth.slice(-8));
+    if (auth.includes(KEY_A.slice(-8))) {
+      return new Response(JSON.stringify({ error: { message: "daily quota exceeded", code: "daily_quota_exceeded" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    fallbackKeys: () => [KEY_B],
+    sessionRetry: 0,
+  });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(res.status, 200, "换号成功后宿主拿到 200");
+  assert.deepEqual(seen, [KEY_A.slice(-8), KEY_B.slice(-8)]);
+});
+
+test("429 换 Key：同账号重试耗尽才换；新账号自己也有独立重试额度", async () => {
+  const { createFetch } = _internal;
+  const seen = [];
+  const fakeFetch = async (url, init = {}) => {
+    const auth = String(init?.headers?.get?.("authorization") ?? "");
+    seen.push(auth.slice(-8));
+    // 前两次都是 A 且撞限；换到 B 之后才 200 —— 这样才需要「A 的重试额度用完 → 换号」
+    if (auth.includes(KEY_A.slice(-8))) {
+      return new Response(JSON.stringify({ error: { message: "busy", code: "session_limit_reached" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ choices: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    fallbackKeys: () => [KEY_B],
+    sessionRetry: 1,
+  });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(res.status, 200);
+  assert.equal(seen.length, 3, "A 试 2 次（1 次重试）→ 换 B");
+  assert.equal(seen[2], KEY_B.slice(-8));
+});
+
+test("429 换 Key：keyFailover:false / 不可重放 body 时都不换号", async () => {
+  const { createFetch } = _internal;
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ error: { message: "daily quota exceeded", code: "daily_quota_exceeded" } }), {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const off = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    fallbackKeys: () => [KEY_B],
+    keyFailover: false,
+  });
+  assert.equal((await off("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" })).status, 429);
+  assert.equal(calls, 1);
+
+  const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("{}")); c.close(); } });
+  const streamFetch = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    fallbackKeys: () => [KEY_B],
+  });
+  assert.equal((await streamFetch("https://100milionseek.top/v1/chat/completions", { method: "POST", body: stream })).status, 429);
+  assert.equal(calls, 2, "流式 body 不换号");
+});
+
+test("Key 池：从 plugin-auth.json 只取本供应商的 hms- Key，去重，可重置", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { createKeyPool } = _internal;
+  const dir = mkdtempSync(join(tmpdir(), "hms-pool-"));
+  const file = join(dir, "auth.json");
+  writeFileSync(file, JSON.stringify({
+    hms: { key: "hms-aaaaaa111111" },
+    "hms#b": { key: "hms-bbbbbb222222" },
+    "hms#c": { key: "hms-cccccc333333" },
+    "hms#d": { key: "hms-bbbbbb222222" }, // 重复
+    other: { key: "hms-zzzzzz999999" },
+    broken: { key: "hms-short" },
+  }), "utf8");
+  const pool = createKeyPool("hms", { path: file });
+  assert.equal(pool.size, 3);
+  assert.deepEqual(pool.candidates("hms-aaaaaa111111"), ["hms-bbbbbb222222", "hms-cccccc333333"]);
+  writeFileSync(file, JSON.stringify({ hms: { key: "hms-dddddd444444" } }), "utf8");
+  assert.equal(pool.size, 3, "TTL 内仍用缓存");
+  pool.reset();
+  assert.equal(pool.size, 1);
+  assert.deepEqual(pool.candidates("hms-dddddd444444"), []);
 });
 

@@ -18,6 +18,7 @@ import {
   SESSION_RETRY_MAX,
   SESSION_RETRY_BASE_MS,
   SESSION_RETRY_MAX_WAIT_MS,
+  KEY_FAILOVER_MAX,
 } from "./config.mjs";
 import { apiKeyOf } from "./auth.mjs";
 import { staticModelTable, peekModelTable } from "./models.mjs";
@@ -235,6 +236,15 @@ export function createFetch(getAuth, opts = {}) {
     ? Math.max(0, Math.min(5, Math.trunc(Number(opts.sessionRetry))))
     : SESSION_RETRY_MAX;
 
+  // 429 时插件内换 Key 重发：opts.fallbackKeys(currentKey) → 其它 Key 数组
+  // 由 index.mjs 从 plugin-auth.json 构造；传 null/不传 = 不换号（测试可精确控制）
+  const fallbackKeys = typeof opts.fallbackKeys === "function" ? opts.fallbackKeys : null;
+  const keyFailoverMax = opts.keyFailover === false
+    ? 0
+    : Number.isFinite(Number(opts.keyFailoverMax))
+      ? Math.max(0, Math.min(10, Math.trunc(Number(opts.keyFailoverMax))))
+      : KEY_FAILOVER_MAX;
+
   return async function magpieFetch(input, init = {}) {
     const timing = debugTiming ? createTiming({ enabled: true, sink: opts.timingSink }) : null;
     const url = typeof input === "string" ? input : input?.url ?? String(input);
@@ -286,9 +296,15 @@ export function createFetch(getAuth, opts = {}) {
     else if (typeof opts.proxy === "string" && opts.proxy) reqInit.proxy = opts.proxy;
     else delete reqInit.proxy;
 
+    let currentKey = key;
     let res;
-    const canRetrySession = isReplayableBody(body ?? init?.body) && sessionRetryMax > 0;
-    for (let attempt = 0; ; attempt += 1) {
+    const replayable = isReplayableBody(body ?? init?.body);
+    const canRetrySession = replayable && sessionRetryMax > 0;
+    const canFailoverKey = replayable && keyFailoverMax > 0 && Boolean(fallbackKeys);
+    const triedKeys = new Set([key]);
+    let sessionAttempt = 0;
+    let keyAttempt = 0;
+    for (;;) {
       try {
         res = await upstreamFetch(target, reqInit);
       } catch (e) {
@@ -321,15 +337,35 @@ export function createFetch(getAuth, opts = {}) {
       });
       if (res?.status === 401) err.signIn = "expired";
 
-      // 站点并发槽位满：等一小会儿再打同一把 Key。宿主看不到这次 429，
-      // 也就不会把整个供应商降温 —— 池子里每账号 5 并发，等一下总有空位。
-      if (canRetrySession && attempt < sessionRetryMax && isSessionLimited(err) && !externalSignal?.aborted) {
-        try {
-          await sleepMs(retryWaitMs(attempt), externalSignal);
-        } catch {
-          if (externalSignal?.aborted) throw abortError();
+      if (err.status === 429 && !externalSignal?.aborted) {
+        // ① 同账号短退避：并发槽位满（每账号 5 并发），等一下通常就有位置
+        if (canRetrySession && sessionAttempt < sessionRetryMax && isSessionLimited(err)) {
+          const wait = retryWaitMs(sessionAttempt);
+          sessionAttempt += 1;
+          try {
+            await sleepMs(wait, externalSignal);
+          } catch {
+            if (externalSignal?.aborted) throw abortError();
+          }
+          continue;
         }
-        continue;
+
+        // ② 换一把 Key 重发：不依赖 magpie 宿主认不认 x-magpie-failover。
+        //    同账号重试已耗尽，或日额度直接耗尽，都走这里。
+        if (canFailoverKey && keyAttempt < keyFailoverMax) {
+          const pool = fallbackKeys(currentKey);
+          const nextKey = Array.isArray(pool)
+            ? pool.find((candidate) => typeof candidate === "string" && candidate && !triedKeys.has(candidate))
+            : null;
+          if (nextKey) {
+            triedKeys.add(nextKey);
+            currentKey = nextKey;
+            keyAttempt += 1;
+            sessionAttempt = 0; // 新账号给它自己的重试额度
+            headers.set("authorization", `Bearer ${nextKey}`); // reqInit.headers 是同一个对象
+            continue;
+          }
+        }
       }
 
       timing?.finish(path, res?.status ?? 0);
