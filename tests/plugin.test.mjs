@@ -584,6 +584,54 @@ test("429 换 Key：keyFailover:false / 不可重放 body 时都不换号", asyn
   assert.equal(calls, 2, "流式 body 不换号");
 });
 
+test("503 upstream_busy（站点过载）：先退避重试，仍失败换 Key，宿主拿到 200", async () => {
+  const { createFetch } = _internal;
+  const seen = [];
+  const fakeFetch = async (url, init = {}) => {
+    const auth = String(init?.headers?.get?.("authorization") ?? "");
+    seen.push(auth.slice(-8));
+    if (seen.length <= 2) {
+      return new Response(
+        JSON.stringify({ error: { message: "The service is busy right now.", code: "upstream_busy" } }),
+        { status: 503, headers: { "content-type": "application/json", "retry-after": "20" } },
+      );
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  // busyRetryBaseMs 收小让测试跑得快；sessionRetry=1 → A 退避重试 1 次仍 503 → 换 B
+  const fetchFn = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    fallbackKeys: () => [KEY_B],
+    busyRetryBaseMs: 10,
+    sessionRetry: 1,
+  });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(res.status, 200, "退避 1 次 + 换号后应成功");
+  assert.deepEqual(seen, [KEY_A.slice(-8), KEY_A.slice(-8), KEY_B.slice(-8)], "A 重试 1 次仍 503 → 换 B");
+});
+
+test("503 upstream_busy：换号两次仍忙 → 503 透出（带 retry-after）", async () => {
+  const { createFetch } = _internal;
+  const fakeFetch = async () =>
+    new Response(JSON.stringify({ error: { message: "busy", code: "upstream_busy" } }), {
+      status: 503,
+      headers: { "content-type": "application/json", "retry-after": "20" },
+    });
+  const fetchFn = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    fallbackKeys: () => [KEY_B, "hms-third333333"],
+    busyRetryBaseMs: 5,
+    sessionRetry: 0,
+    keyFailoverMax: 2,
+  });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(res.status, 503);
+  assert.equal(res.headers.get("retry-after"), "20");
+});
+
 test("Key 池：从 plugin-auth.json 只取本供应商的 hms- Key，去重，可重置", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

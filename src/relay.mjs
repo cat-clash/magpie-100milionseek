@@ -19,6 +19,7 @@ import {
   SESSION_RETRY_BASE_MS,
   SESSION_RETRY_MAX_WAIT_MS,
   KEY_FAILOVER_MAX,
+  BUSY_RETRY_BASE_MS,
 } from "./config.mjs";
 import { apiKeyOf } from "./auth.mjs";
 import { staticModelTable, peekModelTable } from "./models.mjs";
@@ -147,7 +148,8 @@ function translateError(error) {
     }
   } else if (status === 503 || /saturated|upstream_busy/i.test(`${code} ${message}`)) {
     finalStatus = 503;
-    const retryRaw = retryRawOf(bodyErr?.retry_after_s, error?.body?.retry_after_s, 5);
+    // 站点的 retry-after 头（如 upstream_busy 的 20s）原样透传给宿主；拿不到再兜底 5s
+    const retryRaw = retryRawOf(bodyErr?.retry_after_s, error?.retryAfterHeader, 5);
     headers.set("retry-after", String(Math.max(1, retryRaw)));
   } else if (status >= 500) {
     finalStatus = status;
@@ -170,6 +172,33 @@ function isSessionLimited(error) {
   const code = String(error?.code ?? "");
   const message = String(error?.message ?? "");
   return error?.status === 429 && /session_limit/i.test(`${code} ${message}`);
+}
+
+/**
+ * 503 upstream_busy / upstream_saturated（2026-11-27 真机实测的重载形态）：
+ * 站点过载时连 5 并发以内也会随机吃到 503，带 retry-after: 20，docs 明说
+ * "Retry after the Retry-After seconds"。与 429 同属「等一等再打」的可重试类。
+ * 换号也合理：别的账号可能正好分到不忙的节点。
+ */
+function isUpstreamBusy(error) {
+  const code = String(error?.code ?? "");
+  const message = String(error?.message ?? "");
+  return error?.status === 503 && /upstream_busy|upstream_saturated/i.test(`${code} ${message}`);
+}
+
+/** 判定这次失败要不要进「等一等再打」的重试链（429 并发 / 503 过载）。 */
+function isTransient(error) {
+  return isSessionLimited(error) || isUpstreamBusy(error);
+}
+
+/** 从错误里读站点建议的等待秒数（retry-after 头 → body.retry_after_s → 兜底）。 */
+function suggestedWaitSec(error) {
+  const bodyErr = error?.body?.error ?? error?.body ?? {};
+  for (const v of [bodyErr?.retry_after_s, bodyErr?.retry_after, error?.retryAfterHeader]) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return isSessionLimited(error) ? 1 : 5;
 }
 
 /**
@@ -231,10 +260,14 @@ export function createFetch(getAuth, opts = {}) {
   const dropRules = Array.isArray(opts.dropTools)
     ? opts.dropTools.filter((s) => typeof s === "string" && s)
     : [];
-  // 429 并发限流时插件内重试几次（默认 2；0 = 关掉）
+  // 429 并发限流 / 503 过载：插件内重试几次（默认 2；0 = 关掉）
   const sessionRetryMax = Number.isFinite(Number(opts.sessionRetry))
     ? Math.max(0, Math.min(5, Math.trunc(Number(opts.sessionRetry))))
     : SESSION_RETRY_MAX;
+  // 503 upstream_busy 的退避基准：站点建议 20s，等满太久；按 docs 打折等（默认 5s 起步）
+  const busyRetryBaseMs = Number.isFinite(Number(opts.busyRetryBaseMs))
+    ? Math.max(1, Math.min(30_000, Math.trunc(Number(opts.busyRetryBaseMs))))
+    : BUSY_RETRY_BASE_MS;
 
   // 429 时插件内换 Key 重发：opts.fallbackKeys(currentKey) → 其它 Key 数组
   // 由 index.mjs 从 plugin-auth.json 构造；传 null/不传 = 不换号（测试可精确控制）
@@ -303,6 +336,7 @@ export function createFetch(getAuth, opts = {}) {
     const canFailoverKey = replayable && keyFailoverMax > 0 && Boolean(fallbackKeys);
     const triedKeys = new Set([key]);
     let sessionAttempt = 0;
+    let busyAttempt = 0;
     let keyAttempt = 0;
     for (;;) {
       try {
@@ -335,23 +369,32 @@ export function createFetch(getAuth, opts = {}) {
         type: parsed?.error?.type || parsed?.type || "",
         body: parsed,
       });
+      // 站点原始 retry-after 头挂到错误上：translateError 原样透传给宿主
+      try {
+        const ra = res?.headers?.get?.("retry-after");
+        if (ra) err.retryAfterHeader = ra;
+      } catch {
+        /* headers 不可读就算了 */
+      }
       if (res?.status === 401) err.signIn = "expired";
 
       if (err.status === 429 && !externalSignal?.aborted) {
-        // ① 同账号短退避：并发槽位满（每账号 5 并发），等一下通常就有位置
-        if (canRetrySession && sessionAttempt < sessionRetryMax && isSessionLimited(err)) {
-          const wait = retryWaitMs(sessionAttempt);
-          sessionAttempt += 1;
-          try {
-            await sleepMs(wait, externalSignal);
-          } catch {
-            if (externalSignal?.aborted) throw abortError();
+        if (isSessionLimited(err)) {
+          // ① 同账号短退避：并发槽位满（每账号 5 并发），等一下通常就有位置
+          if (canRetrySession && sessionAttempt < sessionRetryMax) {
+            const wait = retryWaitMs(sessionAttempt);
+            sessionAttempt += 1;
+            try {
+              await sleepMs(wait, externalSignal);
+            } catch {
+              if (externalSignal?.aborted) throw abortError();
+            }
+            continue;
           }
-          continue;
         }
-
         // ② 换一把 Key 重发：不依赖 magpie 宿主认不认 x-magpie-failover。
-        //    同账号重试已耗尽，或日额度直接耗尽，都走这里。
+        //    session 类重试已耗尽、日额度直接耗尽（daily_quota_exceeded，不等 reset）
+        //    —— 都换号，另一把 Key 是独立的额度与并发槽位。
         if (canFailoverKey && keyAttempt < keyFailoverMax) {
           const pool = fallbackKeys(currentKey);
           const nextKey = Array.isArray(pool)
@@ -363,6 +406,34 @@ export function createFetch(getAuth, opts = {}) {
             keyAttempt += 1;
             sessionAttempt = 0; // 新账号给它自己的重试额度
             headers.set("authorization", `Bearer ${nextKey}`); // reqInit.headers 是同一个对象
+            continue;
+          }
+        }
+      } else if (err.status === 503 && isUpstreamBusy(err) && !externalSignal?.aborted) {
+        // ① 同账号退避：站点过载（实测 ≤5 并发也随机吃到 503 upstream_busy，retry-after:20）。
+        //    不用等满 20s：按 5s 基准翻倍等，等的同时别的请求会消化掉队列。
+        if (canRetrySession && busyAttempt < sessionRetryMax) {
+          const base = busyRetryBaseMs * 2 ** busyAttempt;
+          busyAttempt += 1;
+          try {
+            await sleepMs(base + Math.round(base * 0.2 * (Math.random() * 2 - 1)), externalSignal);
+          } catch {
+            if (externalSignal?.aborted) throw abortError();
+          }
+          continue;
+        }
+        // ② 换 Key：另一把 Key 可能正打在不忙的节点上（无粘性，值得一试）。
+        if (canFailoverKey && keyAttempt < keyFailoverMax) {
+          const pool = fallbackKeys(currentKey);
+          const nextKey = Array.isArray(pool)
+            ? pool.find((candidate) => typeof candidate === "string" && candidate && !triedKeys.has(candidate))
+            : null;
+          if (nextKey) {
+            triedKeys.add(nextKey);
+            currentKey = nextKey;
+            keyAttempt += 1;
+            busyAttempt = 0;
+            headers.set("authorization", `Bearer ${nextKey}`);
             continue;
           }
         }

@@ -51,6 +51,8 @@
 | --- | --- | --- |
 | `session_limit_reached` | 第 6 个并发请求 | 插件内短退避重试（`sessionRetry`，默认 2 次，250ms→500ms + jitter）；仍失败就换池子里另一把 Key 重发 |
 | `daily_quota_exceeded` | 当日额度用完 | 插件内直接换另一把 Key 重发（`keyFailover`，默认开，最多换 2 把） |
+| `503 upstream_busy` | **站点过载**（2026-11-27 真机实测：≤5 并发也会随机吃到，retry-after: 20） | 同账号按 5s 基准退避（`busyRetryBaseMs`）→ 仍忙换 Key → 全败才透出 503（retry-after 原样透传） |
+| `524`（Cloudflare） | 源站超时（长生成请求） | **不重试**：重发=双倍计费+双倍时长，直接透传 |
 
 **换号不依赖宿主**：magpie 主程序识别的响应头里没有 `x-magpie-failover` / `x-magpie-retry`
 （2026-11-26 查二进制里的 `MAGPIE_ONLY` 常量表），所以 1.3.1 起插件自己读
@@ -258,7 +260,7 @@ bun test tests/plugin.test.mjs
 node --test tests/plugin.test.mjs
 ```
 
-37 个用例覆盖：导出形态、config 装配、智能识别/去重/截断、脱敏、登录态结构、转发分档（401/429/成功透传）、配额窗口、模型表合并与 judge 过滤、上游元数据映射、429 并发重试（成功/用尽/关闭/流式 body 不重发）、429 插件内换 Key（额度耗尽/重试耗尽后换、开关、池子读取去重）、options 收口。
+39 个用例覆盖：导出形态、config 装配、智能识别/去重/截断、脱敏、登录态结构、转发分档（401/429/503/成功透传）、配额窗口、模型表合并与 judge 过滤、上游元数据映射、429 并发重试（成功/用尽/关闭/流式 body 不重发）、429 插件内换 Key（额度耗尽/重试耗尽后换、开关、池子读取去重）、503 upstream_busy 重试与换 Key、options 收口。
 
 ---
 

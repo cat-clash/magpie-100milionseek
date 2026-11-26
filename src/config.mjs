@@ -3,7 +3,7 @@
 
 export const PROVIDER = "hms";
 export const PROVIDER_NAME = "100 Million Seek";
-export const VERSION = "1.3.1";
+export const VERSION = "1.3.2";
 
 // ---- 上游端点（base 固定，不提供自定义入口）---------------------------------
 export const BASE = "https://100milionseek.top/v1";
@@ -51,6 +51,11 @@ export const CHAT_ENDPOINT_RE = /(^|\/)chat\/completions$/;
 export const SESSION_RETRY_MAX = 2; // 最多重试 2 次（共 3 次尝试）
 export const SESSION_RETRY_BASE_MS = 250; // 250ms → 500ms，叠加 ±20% jitter
 export const SESSION_RETRY_MAX_WAIT_MS = 3_000; // 单次等待上限，避免把流卡成假死
+
+// ---- 503 upstream_busy（站点过载）------------------------------------------
+// 2026-11-27 真机实测：过载时即使 ≤5 并发也随机吃到 503 upstream_busy，
+// retry-after: 20。等满 20s 太拖；按 5s 基准退避（1x → 2x），配合换号基本能过。
+export const BUSY_RETRY_BASE_MS = 5_000;
 
 // ---- 429 时在插件内换 Key（不依赖 magpie 是否认识 x-magpie-failover）----------
 // 同账号重试仍失败 / 日额度耗尽时，拿本供应商池子里的另一把 Key 重发一次。
