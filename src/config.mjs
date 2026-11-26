@@ -3,7 +3,7 @@
 
 export const PROVIDER = "hms";
 export const PROVIDER_NAME = "100 Million Seek";
-export const VERSION = "1.3.3";
+export const VERSION = "1.3.4";
 
 // ---- 上游端点（base 固定，不提供自定义入口）---------------------------------
 export const BASE = "https://100milionseek.top/v1";
