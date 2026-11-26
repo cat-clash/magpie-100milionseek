@@ -43,6 +43,7 @@ import {
 } from "./src/auth.mjs";
 import { createFetch } from "./src/relay.mjs";
 import { createKeyPool } from "./src/key-pool.mjs";
+import { createKeyHealth } from "./src/key-health.mjs";
 import {
   staticModelTable,
   fetchModelTable,
@@ -148,7 +149,8 @@ export const HundredMillionSeekPlugin = async (input = {}, options = {}) => {
 
   // 429 换号用的 Key 池：读 Magpie 登录态文件，按 provider 取同站的其他 hms- Key。
   // 只在插件工厂构造一次；读盘有 30s 缓存，不进请求热路径。
-  const keyPool = opts.keyFailover ? createKeyPool(provider) : null;
+  // 1.3.3：池子带健康账本（key-health），冷却中的账号会被排到最后。
+  const keyPool = opts.keyFailover ? createKeyPool(provider, { healthFile: opts.healthFile }) : null;
   const fallbackKeysFor = (currentKey) => keyPool?.candidates(currentKey) ?? [];
 
   // loader 的 fetch 只创建一次，后续所有请求复用同一闭包。
@@ -168,6 +170,7 @@ export const HundredMillionSeekPlugin = async (input = {}, options = {}) => {
         sessionRetry: opts.sessionRetry,
         keyFailover: opts.keyFailover,
         fallbackKeys: fallbackKeysFor,
+        health: keyPool?.health,
       });
       fetchCache.set(getAuth, sharedFetch);
     }
@@ -230,7 +233,21 @@ export const HundredMillionSeekPlugin = async (input = {}, options = {}) => {
     },
 
     async usage(getAuth) {
-      return usageFor(getAuth)();
+      const base = await usageFor(getAuth)();
+      // 1.3.3：把账号池概览拼进 plan 文案（宿主只显示这一个字段），
+      // 让用户一眼看到「18 把里还有几把能用」，而不用去翻 CLI。
+      if (keyPool) {
+        try {
+          const s = keyPool.summary();
+          if (s.total > 1) {
+            const usable = Math.max(0, s.total - s.cooling);
+            base.plan = `${base.plan || "100 Million Seek"} · 池 ${usable}/${s.total} 可用`;
+          }
+        } catch {
+          /* 概览失败不影响额度本身 */
+        }
+      }
+      return base;
     },
 
     // Magpie 宿主 importFiles 契约：auth.import(texts, { signal }) 返回
@@ -328,6 +345,7 @@ export const _internal = {
   apiKeyOf,
   createFetch,
   createKeyPool,
+  createKeyHealth,
   staticModelTable,
   fetchModelTable,
   mergeModelTables,

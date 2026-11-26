@@ -632,6 +632,169 @@ test("503 upstream_busy：换号两次仍忙 → 503 透出（带 retry-after）
   assert.equal(res.headers.get("retry-after"), "20");
 });
 
+test("Key 健康：额度耗尽的账号被记冷却，池子把它排到最后（不再白撞）", async () => {
+  const { mkdtempSync, writeFileSync, readFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { createKeyPool } = _internal;
+  const KA = "hms-aaa111bbb222";
+  const KB = "hms-bbb222ccc333";
+  const KC = "hms-ccc333ddd444";
+  const dir = mkdtempSync(join(tmpdir(), "hms-health-"));
+  const authFile = join(dir, "auth.json");
+  const healthFile = join(dir, "health.json");
+  writeFileSync(authFile, JSON.stringify({
+    hms: { key: KA },
+    "hms#b": { key: KB },
+    "hms#c": { key: KC },
+  }), "utf8");
+
+  const pool = createKeyPool("hms", { path: authFile, healthFile });
+  assert.deepEqual(pool.candidates(KA), [KB, KC], "初始全健康，保持原顺序");
+
+  // B 额度耗尽 → 记到站点 reset_at
+  pool.health.markFailure(KB, "quota", { resetAt: Date.now() + 24 * 3600_000 });
+  assert.deepEqual(pool.candidates(KA), [KC, KB], "冷却中的 B 必须排到最后，健康账号优先");
+  assert.equal(pool.summary().cooling, 1);
+
+  // 落盘校验：只存指纹，不存明文 Key
+  const raw = readFileSync(healthFile, "utf8");
+  assert.equal(raw.includes(KB), false, "健康账本绝不能写明文 Key");
+
+  // 成功一次即解除冷却
+  pool.health.markSuccess(KB);
+  assert.deepEqual(pool.candidates(KA), [KB, KC]);
+  assert.equal(pool.summary().cooling, 0);
+});
+
+test("Key 健康：冷却状态跨实例持久化（重启插件后仍然记得谁废了）", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { createKeyHealth } = _internal;
+  const dir = mkdtempSync(join(tmpdir(), "hms-health-persist-"));
+  const file = join(dir, "h.json");
+  const K = "hms-zzz999yyy888";
+
+  const a = createKeyHealth({ file });
+  a.markFailure(K, "quota", { resetAt: Date.now() + 3600_000 });
+  assert.equal(a.isCooling(K), true);
+
+  // 新实例（模拟插件重启 / 另一进程）读同一文件
+  const b = createKeyHealth({ file });
+  assert.equal(b.isCooling(K), true, "冷却必须持久化，不能只活在一个进程里");
+  assert.equal(b.snapshot().cooling, 1);
+  assert.equal(b.snapshot().rows[0].kind, "quota");
+});
+
+test("Key 健康：冷却到期自动失效；不同 kind 用不同时长", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { createKeyHealth } = _internal;
+  const dir = mkdtempSync(join(tmpdir(), "hms-health2-"));
+  let clock = 1_000_000;
+  const health = createKeyHealth({ file: join(dir, "h.json"), now: () => clock, persist: false });
+
+  const until = health.markFailure("hms-aaa111bbb222", "busy", { retryAfterSec: 20 });
+  assert.equal(until, clock + 20_000);
+  assert.equal(health.isCooling("hms-aaa111bbb222"), true);
+  clock += 20_001;
+  assert.equal(health.isCooling("hms-aaa111bbb222"), false, "到期即自动失效，无需清理");
+
+  // session 类只冷 2s
+  const s = health.markFailure("hms-bbb222ccc333", "session", {});
+  assert.equal(s, clock + 2_000);
+  // auth 类冷 6h
+  const a = health.markFailure("hms-ccc333ddd444", "auth", {});
+  assert.equal(a, clock + 6 * 3600_000);
+});
+
+test("Key 健康：quota 冷却按站点 reset_at 算，拿不到就落到次日 UTC 0 点", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { createKeyHealth } = _internal;
+  const dir = mkdtempSync(join(tmpdir(), "hms-health3-"));
+  const nowMs = Date.UTC(2026, 10, 27, 6, 0, 0); // 2026-11-27 06:00 UTC
+  const health = createKeyHealth({ file: join(dir, "h.json"), now: () => nowMs, persist: false });
+
+  const withReset = health.markFailure("hms-aaaaaa111111", "quota", { resetAt: "2026-11-27T08:00:00.000Z" });
+  assert.equal(withReset, Date.UTC(2026, 10, 27, 8, 0, 0), "按站点 reset_at 精确冷却");
+
+  const withoutReset = health.markFailure("hms-bbbbbb222222", "quota", {});
+  assert.equal(withoutReset, Date.UTC(2026, 10, 28, 0, 0, 0), "没 reset_at 就等次日 UTC 0 点");
+});
+
+test("relay × 健康账本：429 额度耗尽会记账（成功换号不会误清被废账号）", async () => {
+  const { createFetch, createKeyHealth } = _internal;
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const health = createKeyHealth({ file: join(mkdtempSync(join(tmpdir(), "hms-relay-health-")), "h.json") });
+
+  const fakeFetch = async (url, init = {}) => {
+    const key = String(init?.headers?.get?.("authorization") ?? "").replace(/^Bearer\s+/i, "");
+    if (key === KEY_A) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "daily quota exceeded",
+            code: "daily_quota_exceeded",
+            reset_at: new Date(Date.now() + 3600_000).toISOString(),
+          },
+        }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ choices: [] }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), {
+    fetchImpl: fakeFetch,
+    health,
+    fallbackKeys: (cur) => (cur === KEY_A ? [KEY_B] : []),
+    sessionRetry: 0,
+  });
+
+  const r = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(r.status, 200, "A 额度耗尽 → 换 B 成功");
+  assert.equal(health.isCooling(KEY_A), true, "被废的 A 必须记为冷却");
+  assert.equal(health.isCooling(KEY_B), false, "换号成功不能把 B 记成冷却");
+});
+
+test("relay × 健康账本：503 upstream_busy 记短冷却；2xx 会清掉自己的记录", async () => {
+  const { createFetch, createKeyHealth } = _internal;
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const health = createKeyHealth({ file: join(mkdtempSync(join(tmpdir(), "hms-relay-busy-")), "h.json") });
+
+  // 全忙：重试与换号都失败 → 最终 503，currentKey 被记 busy
+  const alwaysBusy = async () =>
+    new Response(JSON.stringify({ error: { message: "busy", code: "upstream_busy" } }), {
+      status: 503,
+      headers: { "content-type": "application/json", "retry-after": "20" },
+    });
+  const f1 = createFetch(() => authBody(KEY_A), {
+    fetchImpl: alwaysBusy,
+    health,
+    busyRetryBaseMs: 1,
+    sessionRetry: 0,
+    fallbackKeys: () => [],
+  });
+  assert.equal((await f1("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" })).status, 503);
+  assert.equal(health.isCooling(KEY_A), true, "过载后应记冷却");
+
+  // 之后成功一次 → 记录被清
+  const f2 = createFetch(() => authBody(KEY_A), {
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [] }), { status: 200, headers: { "content-type": "application/json" } }),
+    health,
+    sessionRetry: 0,
+  });
+  await f2("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(health.isCooling(KEY_A), false, "成功即清记录（半开探测通过）");
+});
+
 test("Key 池：从 plugin-auth.json 只取本供应商的 hms- Key，去重，可重置", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

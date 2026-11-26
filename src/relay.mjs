@@ -277,6 +277,15 @@ export function createFetch(getAuth, opts = {}) {
     : Number.isFinite(Number(opts.keyFailoverMax))
       ? Math.max(0, Math.min(10, Math.trunc(Number(opts.keyFailoverMax))))
       : KEY_FAILOVER_MAX;
+  // 账号健康账本：失败记一笔（冷却），成功清一笔。不注入就完全不做（测试可控）。
+  const health = opts.health && typeof opts.health.markFailure === "function" ? opts.health : null;
+  const noteFailure = (key, kind, info) => {
+    try {
+      health?.markFailure?.(key, kind, info);
+    } catch {
+      /* 账本出问题不影响请求 */
+    }
+  };
 
   return async function magpieFetch(input, init = {}) {
     const timing = debugTiming ? createTiming({ enabled: true, sink: opts.timingSink }) : null;
@@ -378,7 +387,10 @@ export function createFetch(getAuth, opts = {}) {
       }
       if (res?.status === 401) err.signIn = "expired";
 
-      if (err.status === 429 && !externalSignal?.aborted) {
+      if (err.status === 401) {
+        // 凭据失效：把账号记进冷却，别再拿它反复试（换号逻辑不处理 401，401 是账号本身废了）
+        noteFailure(currentKey, "auth");
+      } else if (err.status === 429 && !externalSignal?.aborted) {
         if (isSessionLimited(err)) {
           // ① 同账号短退避：并发槽位满（每账号 5 并发），等一下通常就有位置
           if (canRetrySession && sessionAttempt < sessionRetryMax) {
@@ -391,6 +403,14 @@ export function createFetch(getAuth, opts = {}) {
             }
             continue;
           }
+          // 槽位真挤：记 2s 冷却，让后续请求别一上来又撞它
+          noteFailure(currentKey, "session", { retryAfterSec: err.retryAfterHeader });
+        } else {
+          // 日额度耗尽：冷却到站点给的 reset_at（拿不到就次日 UTC 0 点）
+          noteFailure(currentKey, "quota", {
+            resetAt: parsed?.error?.reset_at ?? parsed?.reset_at,
+            retryAfterSec: err.retryAfterHeader ?? parsed?.error?.retry_after_s,
+          });
         }
         // ② 换一把 Key 重发：不依赖 magpie 宿主认不认 x-magpie-failover。
         //    session 类重试已耗尽、日额度直接耗尽（daily_quota_exceeded，不等 reset）
@@ -422,6 +442,8 @@ export function createFetch(getAuth, opts = {}) {
           }
           continue;
         }
+        // 退避也没用：记 15s 冷却（站点建议 20s，取一半避免过度保守）
+        noteFailure(currentKey, "busy", { retryAfterSec: err.retryAfterHeader });
         // ② 换 Key：另一把 Key 可能正打在不忙的节点上（无粘性，值得一试）。
         if (canFailoverKey && keyAttempt < keyFailoverMax) {
           const pool = fallbackKeys(currentKey);
@@ -441,6 +463,13 @@ export function createFetch(getAuth, opts = {}) {
 
       timing?.finish(path, res?.status ?? 0);
       return translateError(err);
+    }
+
+    // 成功：清掉这把 Key 的失败记录（成功即证明账号健康）
+    try {
+      health?.markSuccess?.(currentKey);
+    } catch {
+      /* 账本出问题不影响请求 */
     }
 
     // 成功响应：Response 直通。headers 只做必要修补，body 不碰（除非 debugTiming 打点）。
