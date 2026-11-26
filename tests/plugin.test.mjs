@@ -795,6 +795,29 @@ test("relay × 健康账本：503 upstream_busy 记短冷却；2xx 会清掉自�
   assert.equal(health.isCooling(KEY_A), false, "成功即清记录（半开探测通过）");
 });
 
+test("doctor 脚本：--quick --json 能跑通并给出结构化结论", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join } = await import("node:path");
+  const root = dirname(dirname(fileURLToPath(import.meta.url)));
+  const script = join(root, "scripts", "doctor.mjs");
+  // --quick 不打网络；用当前运行时跑（bun 或 node 皆可）
+  const out = execFileSync(process.execPath, [script, "--quick", "--json"], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, HMS_HEALTH_FILE: join(root, "tests", ".doctor-tmp-health.json") },
+  });
+  const j = JSON.parse(out);
+  assert.equal(typeof j.version, "string");
+  assert.equal(typeof j.ok, "boolean");
+  assert.ok(Array.isArray(j.rows), "必须给出逐项结果");
+  assert.ok(j.rows.some((r) => r.label.includes("登录态")), "必须检查登录态");
+  assert.ok(j.rows.some((r) => r.label.includes("账号池")), "必须检查账号池");
+  // 任何一行的 detail 都不许出现明文 Key
+  const dump = JSON.stringify(j);
+  assert.equal(/hms-[A-Za-z0-9_-]{20,}/.test(dump), false, "doctor 输出绝不能带明文 Key");
+});
+
 test("Key 池：从 plugin-auth.json 只取本供应商的 hms- Key，去重，可重置", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

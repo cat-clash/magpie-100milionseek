@@ -9,12 +9,14 @@
     "index.mjs",
     "src",
     "cli",
+    "scripts",
     "tests",
     "README.md"
   ],
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "import": "node cli/import-keys.mjs"
+    "import": "node cli/import-keys.mjs",
+    "doctor": "node scripts/doctor.mjs"
   },
   "engines": {
     "bun": ">=1.1.0",
