@@ -5,6 +5,55 @@
 - **统一 API**：`https://100milionseek.top/v1`，只填 `hms-` 开头的 API Key 即可登录。
 - **一键批量导入**：把一大段 Key 粘进去（每行一个、带备注、带序号、JSON……都能识别），自动去重、自动校验、批量写入 Magpie 的登录态文件。
 - 模型 `deepseek-v4.1-flash-free`（198K 上下文 / 64K 输出），读 `x-quota-*` 响应头显示每日额度。
+- **1.3.0**：模型表按「真能 chat」过滤（judge 模型不进表，选了不会 400）；429 并发限流在插件内先
+  退避重试（`sessionRetry`，默认 2 次），宿主基本看不到限流。
+
+---
+
+## 模型：全站只有一个 chat 模型（2026-11-26 实测）
+
+「500,000,000 token 的档位能调用哪些模型」的答案是**一个**，不是两个、也没有隐藏款：
+
+| 证据 | 结果 |
+| --- | --- |
+| `GET /v1/models`（18 把 Key 全扫一遍） | 全部只回 2 条：`deepseek-v4.1-flash-free`、`jev-1.13-free` |
+| `POST /v1/chat/completions` 逐 id 试 | 只有 `deepseek-v4.1-flash-free` 可用；`jev-1.13-free` 回 `400 wrong_endpoint` |
+| 另一批候选 id（deepseek-v4.1-pro / deepseek-chat / gpt-5.4 / claude-sonnet-4.6 / qwen3-max / kimi-k2 / glm-4.6 / hy3 …共 24 个） | 一律 `404 model_not_found` |
+| `GET /api/status`（公开） | `model.id` 只有一个：`deepseek-v4.1-flash-free` |
+| 官网 `/join` 付费档（$1/$3/$5） | 只放开**每分钟请求数**与**并发数**，不换模型 |
+| `GET /v1/responses`、`POST /v1/embeddings` | `404 not_found` —— 不存在 |
+
+所以：
+
+- **chat 模型 = `deepseek-v4.1-flash-free`**（198K 输入 / 64K 输出，1x 计费，支持 stream 与 tools）。
+- **`jev-1.13-free` 是 judge 模型**：只服务 `POST /v1/systemone`，入参 `{model, state, questions}`，
+  出一组「每题一个概率」，0.2x 计费。拿去 `/chat/completions` 会 400，所以 1.3.0 起
+  **不再并进 Magpie 模型表**（以前它会被列出来，选中就报错）。
+  要用它就直接打 base URL（relay 对 `/v1/systemone` 是原样透传）：
+
+  ```bash
+  curl https://100milionseek.top/v1/systemone \
+    -H "Authorization: Bearer $HMS_API_KEY" -H "Content-Type: application/json" \
+    -d '{"model":"jev-1.13-free","state":{...},"questions":["这样回答有帮助吗？"]}'
+  ```
+
+- **额度**：`500,000,000` token/账号/天（里程碑活动，至 2026-12-03 02:14 UTC；活动结束回到
+  100,000,000/天）。这是**同一把 Key 的日额度上限**，跟模型数量无关。多账号池化才是把额度变大的
+  唯一办法：18 个账号 ≈ **90 亿 token/天**、并发 90（每账号硬限 5）。
+
+---
+
+## 限流（429）是怎么被消掉的
+
+站点对**每账号**有两道闸：5 个并发、每日 token 额度。
+
+| 429 code | 含义 | 本插件行为 |
+| --- | --- | --- |
+| `session_limit_reached` | 第 6 个并发请求 | 插件内短退避重试（`sessionRetry`，默认 2 次，250ms→500ms + jitter）；仍失败才返回 429，并同时带 `retry-after` + `x-magpie-failover: true`（换下一个账号，别让这个号干等） |
+| `daily_quota_exceeded` | 当日额度用完 | 直接 `x-magpie-failover: true`，宿主换下一个账号 |
+
+要点：宿主只会看到「真的挤不出来」的那种 429，而且一次只影响一个账号 —— 池子里还有 17 个。
+**别把 `maxConcurrency` 调到 5 以上**：站点硬限 5，超了必然 429。
 
 ---
 
@@ -134,7 +183,8 @@ bun cli/import-keys.mjs --dry-run keys.txt
         "keyLabel": "",               // 单 Key 登录默认备注
         "debugTiming": false,         // 打开后 stderr 打一行 [hms] 耗时（TTFB/总耗时）
         "proxy": "",                  // ""=跟环境变量；"direct"=强制直连；或 "http://127.0.0.1:7897"
-        "dropTools": []               // 转发层裁掉的工具名单：精确名或前缀通配，如 ["mcp__github__*","read_file"]
+        "dropTools": [],              // 转发层裁掉的工具名单：精确名或前缀通配，如 ["mcp__github__*","read_file"]
+        "sessionRetry": 2             // 429 并发限流时插件内重试次数（0=关，直接交给宿主）
       }
     }
   ]
@@ -181,7 +231,8 @@ CLI 导入同理：`bun cli/import-keys.mjs --direct keys.txt` 或 `--proxy http
 
 ## 额度与并发
 
-- 每账号每 UTC 日 **100,000,000 tokens**（主账号 120,000,000），响应头 `x-quota-limit / used / remaining / reset`。
+- 每账号每 UTC 日 **100,000,000 tokens**（里程碑活动期间 **500,000,000**；2026-11-26 实测 17 个号是 500M、
+  1 个号是 520M），响应头 `x-quota-limit / used / remaining / reset`。
 - 额度窗口按 Magpie 契约上报：`used` 是**百分比**（0–100），绝对用量走 `amount` + `limit`，`display` 直接显示剩余 token（如 `626,038 / 100,000,000 tokens · 99,373,962 tokens left`）。用量很小时会正确显示接近 0%（而不是把绝对数误当百分比显示成「剩余 0%」）。
 - 每账号并发上限 **5**；第 6 个请求站点返回 `429 session_limit_reached`，本插件标记退避。
 - 日额度耗尽 `429 daily_quota_exceeded`：本插件标记 `x-magpie-failover`，让 Magpie 自动切到下一个账号。
@@ -197,7 +248,7 @@ bun test tests/plugin.test.mjs
 node --test tests/plugin.test.mjs
 ```
 
-20 个用例覆盖：导出形态、config 装配、智能识别/去重/截断、脱敏、登录态结构、转发分档（401/429/成功透传）、配额窗口、模型表合并、options 收口。
+32 个用例覆盖：导出形态、config 装配、智能识别/去重/截断、脱敏、登录态结构、转发分档（401/429/成功透传）、配额窗口、模型表合并与 judge 过滤、上游元数据映射、429 并发重试（成功/用尽/关闭/流式 body 不重发）、options 收口。
 
 ---
 

@@ -345,3 +345,157 @@ test("createFetch 支持 dropTools：chat 请求裁工具，/models 不受影响
   assert.equal(calls.length, 1, "本地应答 /models，不打上游");
 });
 
+// ─────────────────────────────────────────────────────────────
+// 1.3.0：模型目录按「真能 chat」过滤 + 上游元数据 + 并发 429 插件内重试
+// ─────────────────────────────────────────────────────────────
+
+test("模型目录：/v1/models 里的 judge 条目（endpoint=/v1/systemone）不进模型表", () => {
+  const { parseModelList, isChatModel } = _internal;
+  const raw = {
+    data: [
+      {
+        id: "deepseek-v4.1-flash-free",
+        object: "model",
+        context_length: 198000,
+        max_output_tokens: 65536,
+        quota_multiplier: 1,
+      },
+      {
+        id: "jev-1.13-free",
+        object: "model",
+        name: "JEV",
+        endpoint: "/v1/systemone",
+        quota_multiplier: 0.2,
+      },
+    ],
+  };
+  const table = parseModelList(raw);
+  assert.deepEqual(Object.keys(table), ["deepseek-v4.1-flash-free"], "judge 模型不能进 chat 模型表");
+  assert.equal(isChatModel(raw.data[1]), false);
+  assert.equal(isChatModel(raw.data[0]), true);
+  // chatOnly:false 时才给全表（诊断/CLI 用）
+  assert.equal(Object.keys(parseModelList(raw, { chatOnly: false })).length, 2);
+});
+
+test("模型目录：上游 context_length / max_output_tokens 被采用（不再永远套默认值）", () => {
+  const { parseModelList } = _internal;
+  const table = parseModelList({
+    data: [{ id: "deepseek-v4.1-flash-free", context_length: 131072, max_output_tokens: 8192 }],
+  });
+  assert.equal(table["deepseek-v4.1-flash-free"].limit.context, 131072);
+  assert.equal(table["deepseek-v4.1-flash-free"].limit.output, 8192);
+  // 上游不给就用 198K / 64K 兜底
+  const fallback = parseModelList({ data: [{ id: "deepseek-v4.1-flash-free" }] });
+  assert.equal(fallback["deepseek-v4.1-flash-free"].limit.context, 198000);
+  assert.equal(fallback["deepseek-v4.1-flash-free"].limit.output, 64000);
+});
+
+test("转发：429 session_limit_reached 先插件内重试，成功则宿主完全看不到 429", async () => {
+  const { createFetch } = _internal;
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response(
+        JSON.stringify({ error: { message: "too many concurrent requests", code: "session_limit_reached" } }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), { fetchImpl: fakeFetch, sessionRetry: 2 });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ model: "deepseek-v4.1-flash-free", messages: [] }),
+  });
+  assert.equal(res.status, 200, "重试成功后必须是 200");
+  assert.equal(calls, 2, "恰好重试一次");
+});
+
+test("转发：429 session_limit 重试用尽后返回 429，并同时带上 failover + retry-after", async () => {
+  const { createFetch } = _internal;
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return new Response(
+      JSON.stringify({ error: { message: "too many concurrent requests", code: "session_limit_reached", retry_after_s: 3 } }),
+      { status: 429, headers: { "content-type": "application/json" } },
+    );
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), { fetchImpl: fakeFetch, sessionRetry: 1 });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(res.status, 429);
+  assert.equal(calls, 2, "sessionRetry=1 → 共 2 次尝试");
+  assert.equal(res.headers.get("x-magpie-failover"), "true", "挤不出槽位就让宿主换号（池子还有别的账号）");
+  assert.equal(res.headers.get("x-magpie-retry"), "backoff");
+  assert.equal(res.headers.get("retry-after"), "3");
+});
+
+test("转发：sessionRetry=0 关闭重试，一次 429 直接透出", async () => {
+  const { createFetch } = _internal;
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ error: { message: "busy", code: "session_limit_reached" } }), {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), { fetchImpl: fakeFetch, sessionRetry: 0 });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: "{}" });
+  assert.equal(res.status, 429);
+  assert.equal(calls, 1);
+});
+
+test("转发：不可重放的 body（ReadableStream）不重试，避免把空 body 再发一次", async () => {
+  const { createFetch } = _internal;
+  let calls = 0;
+  const fakeFetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ error: { message: "busy", code: "session_limit_reached" } }), {
+      status: 429,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const fetchFn = createFetch(() => authBody(KEY_A), { fetchImpl: fakeFetch, sessionRetry: 2 });
+  const stream = new ReadableStream({
+    start(c) {
+      c.enqueue(new TextEncoder().encode("{}"));
+      c.close();
+    },
+  });
+  const res = await fetchFn("https://100milionseek.top/v1/chat/completions", { method: "POST", body: stream });
+  assert.equal(res.status, 429);
+  assert.equal(calls, 1, "流式 body 不能重发");
+});
+
+test("模型表：合并优先级 在线元数据 > 静态兜底，用户改动 > 两者", () => {
+  const base = staticModelTable();
+  // 在线上游给了更小的窗口 → 必须覆盖静态兜底（旧版被 `if (!merged[id])` 挡住）
+  const merged = mergeModelTables(
+    base,
+    { "deepseek-v4.1-flash-free": { id: "deepseek-v4.1-flash-free", name: "在线名", limit: { context: 131072, output: 8192 } } },
+    {},
+  );
+  assert.equal(merged["deepseek-v4.1-flash-free"].limit.context, 131072);
+  assert.equal(merged["deepseek-v4.1-flash-free"].limit.output, 8192);
+  assert.equal(merged["deepseek-v4.1-flash-free"].name, "在线名");
+  // 用户显式改动再压过在线
+  const userWins = mergeModelTables(
+    base,
+    { "deepseek-v4.1-flash-free": { id: "deepseek-v4.1-flash-free", limit: { context: 131072 } } },
+    { "deepseek-v4.1-flash-free": { disabled: true, limit: { context: 1000 } } },
+  );
+  assert.equal(userWins["deepseek-v4.1-flash-free"].limit.context, 1000);
+  assert.equal(userWins["deepseek-v4.1-flash-free"].disabled, true);
+});
+
+test("options：sessionRetry 收口（0 合法、超界截断、非法回退默认）", () => {
+  assert.equal(_internal.readOptions({ sessionRetry: 0 }).sessionRetry, 0);
+  assert.equal(_internal.readOptions({ sessionRetry: 99 }).sessionRetry, 5);
+  assert.equal(_internal.readOptions({ sessionRetry: "x" }).sessionRetry, 2);
+});
+

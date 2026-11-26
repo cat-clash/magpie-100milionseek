@@ -48,6 +48,8 @@ import {
   mergeModelTables,
   cachedModelTable,
   peekModelTable,
+  parseModelList,
+  isChatModel,
 } from "./src/models.mjs";
 import { createUsage } from "./src/usage.mjs";
 import { redact } from "./src/http.mjs";
@@ -106,6 +108,13 @@ function readOptions(raw = {}) {
         : typeof raw.proxy === "string"
           ? raw.proxy.trim()
           : DEFAULTS.proxy,
+    // 429 并发限流时插件内重试次数（0 = 关，直接交给宿主）
+    sessionRetry: clampInt(
+      raw.sessionRetry,
+      CLAMP.sessionRetry[0],
+      CLAMP.sessionRetry[1],
+      DEFAULTS.sessionRetry
+    ),
   };
 }
 
@@ -148,6 +157,7 @@ export const HundredMillionSeekPlugin = async (input = {}, options = {}) => {
         debugTiming: opts.debugTiming,
         dropTools: opts.dropTools,
         proxy: opts.proxy,
+        sessionRetry: opts.sessionRetry,
       });
       fetchCache.set(getAuth, sharedFetch);
     }
@@ -312,6 +322,8 @@ export const _internal = {
   mergeModelTables,
   cachedModelTable,
   peekModelTable,
+  parseModelList,
+  isChatModel,
   createUsage,
   poolInfo,
   DEFAULTS,

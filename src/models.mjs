@@ -1,10 +1,14 @@
 // src/models.mjs — 静态模型目录 + 可选的在线刷新。
-// docs 明确只给一个模型；在线 /v1/models 若返回更多，作为附加项合并。
+// 2026-11-26 实测：上游 /v1/models 只回两条 —— deepseek-v4.1-flash-free（chat，1x）
+// 与 jev-1.13-free（judge，只服务 /v1/systemone，0.2x）。后者拿来 chat 会 400
+// wrong_endpoint，所以**不并进模型表**（否则用户在 Magpie 里选中一个必然报错的项）。
 // 缓存：进程内单例 TTL + singleflight，刷新模型列表最多每小时打一次上游。
 import {
   DEFAULT_MODEL,
   MODEL_CONTEXT,
   MODEL_OUTPUT,
+  MODEL_LABELS,
+  CHAT_ENDPOINT_RE,
   PROVIDER_NAME,
   MODEL_LIST_TTL_MS,
   MODEL_LIST_TIMEOUT_MS,
@@ -15,9 +19,18 @@ import { createTtlCache, singleflight } from "./cache.mjs";
 
 /** magpie 需要的模型条目形状。 */
 export function modelEntry(id, live = {}) {
-  const name = typeof live.name === "string" && live.name.trim() ? live.name.trim() : id;
-  const context = Math.max(1, Number(live.limit?.context) || MODEL_CONTEXT);
-  const output = Math.max(1, Number(live.limit?.output) || MODEL_OUTPUT);
+  const name =
+    (typeof live.name === "string" && live.name.trim()) || MODEL_LABELS[id] || id;
+  // 上游用的是 OpenAI 风格的 context_length / max_output_tokens；
+  // 旧版只读 live.limit.*（上游从不给），于是永远落到默认值 —— 上游改窗口就跟不上。
+  const context = Math.max(
+    1,
+    Number(live.context_length) || Number(live.limit?.context) || MODEL_CONTEXT,
+  );
+  const output = Math.max(
+    1,
+    Number(live.max_output_tokens) || Number(live.limit?.output) || MODEL_OUTPUT,
+  );
   return {
     id,
     name,
@@ -31,7 +44,21 @@ export function modelEntry(id, live = {}) {
       cache_read: 0,
       cache_write: 0,
     },
+    // 上游的额度倍率（1x / 0.2x）；magpie 不认识，但 usage/诊断会用到
+    ...(Number(live.quota_multiplier) ? { quota_multiplier: Number(live.quota_multiplier) } : {}),
   };
+}
+
+/**
+ * 条目能不能当 chat 模型用。
+ * 上游对 judge 模型给了 `endpoint: "/v1/systemone"`；没有 endpoint 字段的按 chat 算
+ * （将来上游不写 endpoint 时不会误杀）。
+ */
+export function isChatModel(live) {
+  if (!live || typeof live !== "object") return true;
+  const endpoint = typeof live.endpoint === "string" ? live.endpoint.trim() : "";
+  if (!endpoint) return true;
+  return CHAT_ENDPOINT_RE.test(endpoint);
 }
 
 /** 静态兜底表（永远可用，不依赖网络）。表内容冻结，避免调用方改到共享对象。 */
@@ -41,14 +68,21 @@ export function staticModelTable() {
   return { ...STATIC_TABLE };
 }
 
-/** 解析 GET /v1/models 的 OpenAI 兼容响应。 */
-export function parseModelList(data) {
+/**
+ * 解析 GET /v1/models 的 OpenAI 兼容响应。
+ * @param {any} data
+ * @param {{chatOnly?: boolean}} [opts] chatOnly 默认 true：把 judge 之类非 chat 端点剔掉
+ */
+export function parseModelList(data, opts = {}) {
+  const chatOnly = opts.chatOnly !== false;
   const out = {};
   const list = Array.isArray(data) ? data : Array.isArray(data?.data) ? data.data : [];
   for (const m of list) {
     const id = typeof m === "string" ? m : m?.id;
     if (typeof id !== "string" || !id) continue;
-    out[id] = modelEntry(id, typeof m === "object" ? m : {});
+    const live = typeof m === "object" && m ? m : {};
+    if (chatOnly && !isChatModel(live)) continue;
+    out[id] = modelEntry(id, live);
   }
   return out;
 }
@@ -150,12 +184,19 @@ export async function cachedModelTable(options = {}) {
 }
 
 /**
- * 合并静态 + 在线：静态默认模型永远保留，用户改过的字段（disabled/limit/name）保留。
+ * 合并静态 + 在线 + 用户改动。优先级：**用户 providerCfg.models > 在线上游 > 静态兜底**。
+ * （1.3.0 修：以前 `if (!merged[id])` 让静态条目挡住在线条目，于是上游的
+ *  context_length / name / quota_multiplier 永远进不来，改了窗口也跟不上。）
  */
 export function mergeModelTables(staticTable, liveTable, previous = {}) {
-  const merged = { ...staticTable };
+  const merged = {};
+  for (const [id, model] of Object.entries(staticTable ?? {})) merged[id] = model;
   for (const [id, model] of Object.entries(liveTable ?? {})) {
-    if (!merged[id]) merged[id] = model;
+    if (!model || typeof model !== "object") continue;
+    const base = merged[id];
+    merged[id] = base
+      ? { ...base, ...model, limit: { ...(base.limit ?? {}), ...(model.limit ?? {}) } }
+      : model;
   }
   for (const [id, prev] of Object.entries(previous ?? {})) {
     if (merged[id] && prev && typeof prev === "object") {

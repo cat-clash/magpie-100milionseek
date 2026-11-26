@@ -15,6 +15,9 @@ import {
   VERIFY_TIMEOUT_MS,
   QUOTA_HEADERS,
   DEFAULTS,
+  SESSION_RETRY_MAX,
+  SESSION_RETRY_BASE_MS,
+  SESSION_RETRY_MAX_WAIT_MS,
 } from "./config.mjs";
 import { apiKeyOf } from "./auth.mjs";
 import { staticModelTable, peekModelTable } from "./models.mjs";
@@ -105,9 +108,17 @@ function translateError(error) {
   const status = error?.status ?? 0;
   const code = String(error?.code ?? "");
   const message = String(error?.message ?? "");
+  const bodyErr = error?.body?.error ?? error?.body ?? {};
   const headers = new Headers();
   let finalStatus = status || 500;
   let signIn = "";
+  const retryRawOf = (...values) => {
+    for (const v of values) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return 0;
+  };
 
   if (status === 401 || /invalid_api_key|missing_api_key|unauthorized/i.test(`${code} ${message}`)) {
     finalStatus = 401;
@@ -115,24 +126,28 @@ function translateError(error) {
     headers.set("x-magpie-sign-in", "expired");
   } else if (status === 429) {
     finalStatus = 429;
-    const bodyErr = error?.body?.error ?? error?.body ?? {};
-    const retryRaw =
-      bodyErr?.retry_after_s ??
-      bodyErr?.retry_after ??
-      error?.body?.retry_after_s ??
-      error?.body?.retry_after ??
-      60;
-    headers.set("retry-after", String(Math.max(1, Number(retryRaw) || 60)));
     if (/session_limit/i.test(`${code} ${message}`)) {
+      // 并发槽位满（站点硬限 5/账号）。插件内已经重试过了，这里仍返回说明真挤：
+      // 同时挂 failover —— 池子里还有别的账号，换号比让这个账号干等更快。
+      const wait = retryRawOf(bodyErr?.retry_after_s, bodyErr?.retry_after, 2);
+      headers.set("retry-after", String(Math.max(1, Math.min(30, Math.round(wait)))));
       headers.set("x-magpie-retry", "backoff");
+      headers.set("x-magpie-failover", "true");
     } else {
+      const retryRaw = retryRawOf(
+        bodyErr?.retry_after_s,
+        bodyErr?.retry_after,
+        error?.body?.retry_after_s,
+        error?.body?.retry_after,
+        60,
+      );
+      headers.set("retry-after", String(Math.max(1, retryRaw)));
       headers.set("x-magpie-failover", "true"); // 日额度耗尽 → magpie 换下一个账号
     }
   } else if (status === 503 || /saturated|upstream_busy/i.test(`${code} ${message}`)) {
     finalStatus = 503;
-    const bodyErr = error?.body?.error ?? error?.body ?? {};
-    const retryRaw = bodyErr?.retry_after_s ?? error?.body?.retry_after_s ?? 5;
-    headers.set("retry-after", String(Math.max(1, Number(retryRaw) || 5)));
+    const retryRaw = retryRawOf(bodyErr?.retry_after_s, error?.body?.retry_after_s, 5);
+    headers.set("retry-after", String(Math.max(1, retryRaw)));
   } else if (status >= 500) {
     finalStatus = status;
   }
@@ -147,6 +162,54 @@ function translateError(error) {
   if (signIn) body.error.sign_in = signIn;
   if (error?.body?.reset_at) body.error.reset_at = error.body.reset_at;
   return errorResponse(finalStatus, body.error.message, body.error.type, body.error.code, headers);
+}
+
+/** 429 里「并发槽位满」这一类：等一下就有位置，值得插件内重试。 */
+function isSessionLimited(error) {
+  const code = String(error?.code ?? "");
+  const message = String(error?.message ?? "");
+  return error?.status === 429 && /session_limit/i.test(`${code} ${message}`);
+}
+
+/**
+ * 请求体能不能重发。
+ * host 传进来的通常是 string / Buffer；ReadableStream 这种一次性 body 不能重试
+ * （再发一次会是空 body），退化成直接返回 429。
+ */
+function isReplayableBody(body) {
+  return (
+    body == null ||
+    typeof body === "string" ||
+    body instanceof Uint8Array ||
+    (typeof Buffer !== "undefined" && Buffer.isBuffer(body))
+  );
+}
+
+/** 指数退避 + ±20% jitter；外部 abort 时立刻结束等待。 */
+function retryWaitMs(attempt) {
+  const base = SESSION_RETRY_BASE_MS * 2 ** attempt;
+  const jitter = base * 0.2 * (Math.random() * 2 - 1);
+  return Math.max(1, Math.min(SESSION_RETRY_MAX_WAIT_MS, Math.round(base + jitter)));
+}
+
+function sleepMs(ms, signal) {
+  if (!(ms > 0)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    if (signal?.aborted) {
+      clearTimeout(timer);
+      reject(abortError());
+      return;
+    }
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
 }
 
 /**
@@ -167,6 +230,10 @@ export function createFetch(getAuth, opts = {}) {
   const dropRules = Array.isArray(opts.dropTools)
     ? opts.dropTools.filter((s) => typeof s === "string" && s)
     : [];
+  // 429 并发限流时插件内重试几次（默认 2；0 = 关掉）
+  const sessionRetryMax = Number.isFinite(Number(opts.sessionRetry))
+    ? Math.max(0, Math.min(5, Math.trunc(Number(opts.sessionRetry))))
+    : SESSION_RETRY_MAX;
 
   return async function magpieFetch(input, init = {}) {
     const timing = debugTiming ? createTiming({ enabled: true, sink: opts.timingSink }) : null;
@@ -220,15 +287,17 @@ export function createFetch(getAuth, opts = {}) {
     else delete reqInit.proxy;
 
     let res;
-    try {
-      res = await upstreamFetch(target, reqInit);
-    } catch (e) {
-      if (isAbort(e) && externalSignal?.aborted) throw abortError();
-      timing?.finish(path, 0);
-      return translateError(new ApiError(errorText(e), { status: 0, cause: e }));
-    }
+    const canRetrySession = isReplayableBody(body ?? init?.body) && sessionRetryMax > 0;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        res = await upstreamFetch(target, reqInit);
+      } catch (e) {
+        if (isAbort(e) && externalSignal?.aborted) throw abortError();
+        timing?.finish(path, 0);
+        return translateError(new ApiError(errorText(e), { status: 0, cause: e }));
+      }
+      if (res?.ok) break;
 
-    if (!res?.ok) {
       // 失败分支不需要保留 body，直接读 text（不 clone，省一次 tee）
       let text = "";
       try {
@@ -251,6 +320,18 @@ export function createFetch(getAuth, opts = {}) {
         body: parsed,
       });
       if (res?.status === 401) err.signIn = "expired";
+
+      // 站点并发槽位满：等一小会儿再打同一把 Key。宿主看不到这次 429，
+      // 也就不会把整个供应商降温 —— 池子里每账号 5 并发，等一下总有空位。
+      if (canRetrySession && attempt < sessionRetryMax && isSessionLimited(err) && !externalSignal?.aborted) {
+        try {
+          await sleepMs(retryWaitMs(attempt), externalSignal);
+        } catch {
+          if (externalSignal?.aborted) throw abortError();
+        }
+        continue;
+      }
+
       timing?.finish(path, res?.status ?? 0);
       return translateError(err);
     }
